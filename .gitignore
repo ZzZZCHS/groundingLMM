@@ -1,0 +1,5 @@
+*.pyc
+*.jpg
+*.png
+GLaMM-FullScope/
+openai/

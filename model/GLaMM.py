@@ -208,14 +208,14 @@ class GLaMMForCausalLM(LlavaLlamaForCausalLM):
             global_enc_image_list.append(global_enc_image_i)
         return torch.cat(global_enc_image_list, dim=0)
 
-    def _process_hidden_states(self, output_hidden_states, seg_token_mask, offset, infer=False):
+    def _process_hidden_states(self, output_hidden_states, seg_token_mask, offset, infer=False, device="cuda:0"):
         hidden_states = [self.model.text_hidden_fcs[0](output_hidden_states[-1])]
         last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
         pred_embeddings = last_hidden_state[seg_token_mask]
         seg_token_counts = seg_token_mask.int().sum(-1)
 
         seg_token_offset = seg_token_counts.cumsum(-1)
-        seg_token_offset = torch.cat([torch.zeros(1).long().cuda(), seg_token_offset], dim=0)
+        seg_token_offset = torch.cat([torch.zeros(1).long().to(device), seg_token_offset], dim=0)
         if not infer:
             seg_token_offset = seg_token_offset[offset]
 
@@ -286,7 +286,7 @@ class GLaMMForCausalLM(LlavaLlamaForCausalLM):
                 "mask_dice_loss": mask_dice_loss, "mask_loss": mask_loss, }
 
     def evaluate(self, global_enc_images, grounding_enc_images, input_ids, resize_list, orig_sizes, max_tokens_new=32,
-                 bboxes=None, ):
+                 bboxes=None, device="cuda:0"):
         with torch.no_grad():
             generation_outputs = self.generate(
                 images=global_enc_images, input_ids=input_ids, bboxes=bboxes, max_new_tokens=max_tokens_new,
@@ -298,10 +298,10 @@ class GLaMMForCausalLM(LlavaLlamaForCausalLM):
             seg_token_mask = generated_output_ids[:, 1:] == self.seg_token_idx
             # Adjusting for IMAGE_TOKEN_INDEX (assuming single image at start)
             seg_token_mask = torch.cat(
-                [torch.zeros((seg_token_mask.shape[0], 575), dtype=torch.bool).cuda(), seg_token_mask], dim=1, )
+                [torch.zeros((seg_token_mask.shape[0], 575), dtype=torch.bool).to(device), seg_token_mask], dim=1, )
             # Process hidden states
             hidden_states, predicted_embeddings = self._process_hidden_states(
-                output_hidden_states, seg_token_mask, None, infer=True
+                output_hidden_states, seg_token_mask, None, infer=True, device=device
             )
             image_embeddings = self.get_grounding_encoder_embs(grounding_enc_images)
             # Generate and post-process masks
