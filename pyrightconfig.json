@@ -1,8 +1,0 @@
-{
-    "exclude": [
-        "mimicgen_datasets/",
-        "GLaMM-FullScope/",
-        "images/",
-        "robocasa_datasets/"
-    ]
-}
