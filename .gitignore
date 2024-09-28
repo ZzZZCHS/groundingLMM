@@ -5,3 +5,8 @@ checkpoints/
 pyrightconfig.json
 data
 attention.py
+*.pyc
+*.jpg
+*.png
+GLaMM-FullScope/
+opena

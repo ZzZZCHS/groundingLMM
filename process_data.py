@@ -20,6 +20,7 @@ from tools.markdown_utils import colors
 from tqdm import tqdm
 import shutil
 import time
+from fastprogress.fastprogress import progress_bar
 
 
 def parse_args(args):
