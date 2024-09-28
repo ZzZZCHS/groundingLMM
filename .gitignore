@@ -3,3 +3,5 @@
 *.png
 GLaMM-FullScope/
 openai/
+mmcv/
+pyrightconfig.json
