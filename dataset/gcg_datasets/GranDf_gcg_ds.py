@@ -137,7 +137,11 @@ class GCGBaseDataset(torch.utils.data.Dataset):
         tokens_positive = sort_by_start_index(tokens_positive, phrase_order)
 
         image = cv2.imread(image_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        try:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        except:
+            print("!"*100, image_path)
+            exit(0)
         # Prepare input for Global Image Encoder
         global_enc_image = self.global_enc_processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
         # Prepare input for Grounding Image Encoder
@@ -179,7 +183,8 @@ class OpenPsgGCGDataset(GCGBaseDataset):
                  image_size=224, num_classes_per_sample=3, validation=False, random_sampling=True):
         json_files = {'validation': "OpenPsgGCG_val.json", 'training': "OpenPsgGCG_train.json"}
         json_path = json_files['validation'] if validation else json_files['training']
-        image_dir = os.path.join("coco_2017", "train2017")
+        # image_dir = os.path.join("coco_2017", "train2017")
+        image_dir = "data/coco_2017"
         mode = "Val" if validation else "Train"
 
         super().__init__(
@@ -193,7 +198,7 @@ class Flickr30kGCGDataset(GCGBaseDataset):
                  image_size=224, num_classes_per_sample=3, validation=False, random_sampling=True):
         json_files = {'validation': "flickr_mergedGT_GCG_val.json", 'training': "flickr_mergedGT_GCG_train.json"}
         json_path = json_files['validation'] if validation else json_files['training']
-        image_dir = os.path.join("flikcr_30k", "train")
+        image_dir = os.path.join("data/flickr_30k", "train")
         mode = "Val" if validation else "Train"
 
         super().__init__(
@@ -281,7 +286,7 @@ class RefCOCOgGCGDataset(GCGBaseDataset):
                  image_size=224, num_classes_per_sample=3, validation=False, random_sampling=True):
         json_files = {'validation': "RefCOCOg_GCG_val.json", 'training': "RefCOCOg_GCG_train.json"}
         json_path = json_files['validation'] if validation else json_files['training']
-        image_dir = os.path.join("coco_2014", "train2014")
+        image_dir = os.path.join("data/coco_2014", "train2014")
         mode = "Val" if validation else "Train"
 
         super().__init__(

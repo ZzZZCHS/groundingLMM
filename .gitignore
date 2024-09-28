@@ -1,0 +1,7 @@
+*.pyc
+*.jpg
+output/
+checkpoints/
+pyrightconfig.json
+data
+attention.py
