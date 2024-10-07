@@ -170,10 +170,12 @@ class SemanticSegmDataset(torch.utils.data.Dataset):
             random_idx = random.randint(0, len(img_ids) - 1)
             img_info = coco_api.loadImgs([img_ids[random_idx]])[0]
             file_name = img_info["file_name"]
-            image_path = (os.path.join(
+            image_path = os.path.join(
                  self.dataset_dir, dataset_name, "VOCdevkit", "VOC2010", "JPEGImages", file_name
-                ) if dataset_name == "pascal_part" else self.dataset_dir.replace("Semantic_Segm/", ""),
-                          "coco_2017", file_name)
+                ) if dataset_name == "pascal_part" else os.path.join(self.dataset_dir, "coco_2017", file_name)
+            # image_path = os.path.join(
+            #      self.dataset_dir, dataset_name, "VOCdevkit", "VOC2010", "JPEGImages", file_name
+            #     ) if dataset_name == "pascal_part" else self.dataset_dir.replace("Semantic_Segm/", "")
 
             annotation_ids = coco_api.getAnnIds(imgIds=img_info["id"])
             annotations = coco_api.loadAnns(annotation_ids)

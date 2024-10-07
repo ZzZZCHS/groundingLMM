@@ -215,7 +215,7 @@ class GLaMMForCausalLM(LlavaLlamaForCausalLM):
         seg_token_counts = seg_token_mask.int().sum(-1)
 
         seg_token_offset = seg_token_counts.cumsum(-1)
-        seg_token_offset = torch.cat([torch.zeros(1).long().to(device), seg_token_offset], dim=0)
+        seg_token_offset = torch.cat([torch.zeros(1).long().to(seg_token_offset.device), seg_token_offset], dim=0)
         if not infer:
             seg_token_offset = seg_token_offset[offset]
 

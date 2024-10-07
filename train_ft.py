@@ -26,7 +26,7 @@ from dataset.dataset import custom_collate_fn
 from tools.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, AverageMeter, ProgressMeter, dict_to_cuda,
                          Summary, intersectionAndUnionGPU)
 
-from dataset.gcg_datasets.GranDf_gcg_ds import GranDfDataset, OpenPsgGCGDataset, Flickr30kGCGDataset, RefCOCOgGCGDataset
+from dataset.gcg_datasets.GranDf_gcg_ds import GranDfDataset, OpenPsgGCGDataset, Flickr30kGCGDataset, RefCOCOgGCGDataset, RobocasaGCGDataset
 from dataset.caption_datasets.COCO_Caption_ds import CocoCapDataset
 from dataset.caption_datasets.LLavaInstruct_vqa_ds import LLaVAInstructDataset
 from dataset.region_datasets.RefCOCO_VG_Region_ds import (RefCocoRegDataset, RefCocoGRegDataset, RefCocoPRegDataset,
@@ -307,6 +307,7 @@ def initialize_datasets_and_loaders(args, tokenizer):
                            "RefCoco_GCG": RefCOCOgGCGDataset,
                            "GranDf_GCG": GranDfDataset,
                            "Flickr_GCG": Flickr30kGCGDataset,
+                           "Robocasa_GCG": RobocasaGCGDataset
                           }
     # Train datasets
     if args.use_cap_data:

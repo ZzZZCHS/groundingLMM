@@ -4,6 +4,7 @@ import subprocess
 from pycocotools.coco import COCO
 from torch.utils.data import Dataset
 from eval.utils import bbox_to_x1y1x2y2
+import json
 
 
 class RegionCapDDP(Dataset):
@@ -39,6 +40,22 @@ class GCGEvalDDP(Dataset):
         image_path = f"{self.image_dir_path}/{image_id}"
 
         return image_id, image_path
+
+
+class RobocasaGCGEvalDDP(Dataset):
+    def __init__(self, image_dir_path, anno_path):
+        self.image_dir_path = image_dir_path
+        self.annos = json.load(open(anno_path, 'r'))
+        self.data = [(x['file_name'], x['prompt']) for x in self.annos]
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        image_id, prompt = self.data[idx]
+        image_path = f"{self.image_dir_path}/{image_id}"
+
+        return image_id, image_path, prompt
 
 
 def setup_for_distributed(is_master):

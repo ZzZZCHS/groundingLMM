@@ -488,6 +488,8 @@ def main(args):
 def save_checkpoint(model_engine, args, epoch, metric_name, metric_value, is_best):
     """ Saves the model checkpoint. """
     # If the checkpoint is the best, save it in ckpt_model_best, else in ckpt_model_last_epoch
+    if not is_best:
+        return
     save_dir_name = "ckpt_model_best" if is_best else "ckpt_model_last_epoch"
     save_dir = os.path.join(args.log_dir, save_dir_name)
     # Ensure the directory exists

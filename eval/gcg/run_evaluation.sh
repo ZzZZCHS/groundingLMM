@@ -14,16 +14,34 @@ NUM_GPUS=1  # Adjust it as per the available #GPU
 # Positional arguments for the bash scripts
 CKPT_PATH=$1
 RESULT_PATH=$2
+MASK_PATH=$3
 
+# -------------------------- original glamm -----------------
 # Path to the GranD-f evaluation dataset images directory
-IMAGE_DIR=./data/GranDf/GranDf_HA_images/val_test
+# IMAGE_DIR=./data/GranDf/GranDf_HA_images/val_test
 
 # Run Inference
-torchrun --nnodes=1 --nproc_per_node="$NUM_GPUS" --master_port="$MASTER_PORT" eval/gcg/infer.py --hf_model_path "$CKPT_PATH" --img_dir "$IMAGE_DIR" --output_dir "$RESULT_PATH"
+# srun --partition=mozi-S1 --gres=gpu:"$NUM_GPUS" --ntasks-per-node=1 --kill-on-bad-exit --quotatype=reserved \
+# torchrun --nnodes=1 --nproc_per_node="$NUM_GPUS" --master_port="$MASTER_PORT" eval/gcg/infer.py --hf_model_path "$CKPT_PATH" --img_dir "$IMAGE_DIR" --output_dir "$RESULT_PATH"
 
 # Path to the GranD-f evaluation dataset ground-truths directory
-GT_DIR=./data/GranDf/annotations/val_test
+# GT_DIR=./data/GranDf/annotations/val_test
 
 # Evaluate
-python eval/gcg/evaluate.py --prediction_dir_path "$RESULT_PATH" --gt_dir_path "$GT_DIR" --split "val"
-python eval/gcg/evaluate.py --prediction_dir_path "$RESULT_PATH" --gt_dir_path "$GT_DIR" --split "test"
+# srun --partition=mozi-S1 --gres=gpu:0 --ntasks-per-node=1 --kill-on-bad-exit --quotatype=reserved \
+#     python eval/gcg/evaluate.py --prediction_dir_path "$RESULT_PATH" --gt_dir_path "$GT_DIR" --split "val"
+# srun --partition=mozi-S1 --gres=gpu:0 --ntasks-per-node=1 --kill-on-bad-exit --quotatype=reserved \
+#     python eval/gcg/evaluate.py --prediction_dir_path "$RESULT_PATH" --gt_dir_path "$GT_DIR" --split "test"
+
+
+# --------------------------- evaluate robocasa ----------------
+IMAGE_DIR="/mnt/petrelfs/huanghaifeng/share_hw/groundingLMM/data/GranDf/robocasa_images"
+ANNO_PATH="/mnt/petrelfs/huanghaifeng/share_hw/groundingLMM/data/GranDf/annotations/train/robocasa_GCG_val.json"
+
+# Run Inference
+# srun --partition=mozi-S1 --gres=gpu:"$NUM_GPUS" --ntasks-per-node=1 --kill-on-bad-exit --quotatype=reserved \
+#     torchrun --nnodes=1 --nproc_per_node="$NUM_GPUS" --master_port="$MASTER_PORT" eval/gcg/infer_robocasa.py --hf_model_path "$CKPT_PATH" --img_dir "$IMAGE_DIR" --output_dir "$RESULT_PATH" --anno_path "$ANNO_PATH"
+
+# Evaluate
+srun --partition=mozi-S1 --gres=gpu:0 --ntasks-per-node=1 --kill-on-bad-exit --quotatype=reserved \
+    python eval/gcg/evaluate_robocasa.py --prediction_dir_path "$RESULT_PATH" --anno_path "$ANNO_PATH" --mask_results_path "$MASK_PATH"

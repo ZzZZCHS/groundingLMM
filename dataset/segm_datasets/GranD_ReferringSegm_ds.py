@@ -119,7 +119,7 @@ class GrandReferSegmDataset(torch.utils.data.Dataset):
 
     def process_data(self, data_item):
         data_labels = data_item['labels']
-        data_masks = data_item['maks']
+        data_masks = data_item['mask']
 
         image_path = data_item['image_path']
         image = cv2.imread(image_path)

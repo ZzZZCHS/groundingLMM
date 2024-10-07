@@ -57,8 +57,9 @@ class GCGBaseDataset(torch.utils.data.Dataset):
 
     def _parse_annotations(self, ann_info):
         image_path = os.path.join(self.image_folder, ann_info['file_name'])
-        annotations = {'labels': [], 'caption': [], 'masks': [], 'tokens_positive': [],
-                       'file_name': ann_info['file_name']}
+        annotations = {
+            'labels': [], 'caption': [], 'masks': [], 'tokens_positive': [], 'file_name': ann_info['file_name'],
+            'prompt': ann_info.get('prompt', None)}
         width, height = Image.open(image_path).size
         annotations['caption'] = ann_info['caption'].strip('"').strip()
 
@@ -86,8 +87,15 @@ class GCGBaseDataset(torch.utils.data.Dataset):
                 break
             else:
                 index = random.randint(0, len(self.data_infos) - 1)
-        data_item = {"image_path": image_path, "filename": ann['file_name'], "caption": ann['caption'],
-            "labels": ann['labels'], "masks": ann['masks'], "tokens_positive": ann['tokens_positive']}
+        data_item = {
+            "image_path": image_path, 
+            "filename": ann['file_name'], 
+            "caption": ann['caption'],
+            "labels": ann['labels'], 
+            "masks": ann['masks'], 
+            "tokens_positive": ann['tokens_positive'],
+            "prompt": ann['prompt']
+        }
         return self.process_data(data_item)
 
     def __len__(self):
@@ -99,9 +107,11 @@ class GCGBaseDataset(torch.utils.data.Dataset):
         x = F.pad(x, (0, self.IMG_SIZE - w, 0, self.IMG_SIZE - h))
         return x
 
-    def create_conversations(self, caption, tokens_positive):
+    def create_conversations(self, caption, tokens_positive, prompt):
         question = random.choice(self.question_templates).strip()
-
+        if prompt is not None:
+            question = prompt + " Please respond with interleaved segmentation masks for the corresponding parts of the answer."
+        
         # Prepare caption with tags
         def tag_caption(caption, tokens):
             for start, end in sorted(tokens, key=lambda x: x[0], reverse=True):
@@ -125,6 +135,7 @@ class GCGBaseDataset(torch.utils.data.Dataset):
         caption = data_item['caption']
         tokens_positive = data_item['tokens_positive']
         image_path = data_item['image_path']
+        prompt = data_item.get('prompt', None)
 
         # Function to sort elements based on the start index of each phrase
         def sort_by_start_index(items, order):
@@ -137,11 +148,7 @@ class GCGBaseDataset(torch.utils.data.Dataset):
         tokens_positive = sort_by_start_index(tokens_positive, phrase_order)
 
         image = cv2.imread(image_path)
-        try:
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        except:
-            print("!"*100, image_path)
-            exit(0)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         # Prepare input for Global Image Encoder
         global_enc_image = self.global_enc_processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
         # Prepare input for Grounding Image Encoder
@@ -150,7 +157,7 @@ class GCGBaseDataset(torch.utils.data.Dataset):
         grounding_enc_image = self.grounding_enc_processor(torch.from_numpy(image).permute(2, 0, 1).contiguous())
         bboxes = None
 
-        questions, conversations = self.create_conversations(caption, tokens_positive)
+        questions, conversations = self.create_conversations(caption, tokens_positive, prompt)
         masks = np.stack(masks, axis=0)
         masks = torch.from_numpy(masks)
         label = torch.ones(masks.shape[1:], dtype=torch.long) * self.IGNORE_LABEL
@@ -176,6 +183,20 @@ class GranDfDataset(GCGBaseDataset):
             dataset_dir, tokenizer, global_image_encoder, epoch_samples, precision, image_size, num_classes_per_sample,
             validation, random_sampling, image_dir, json_path, )
         print('\033[92m' + "----GCG-{}: GranDf-GCG dataset initialized----".format(mode) + '\033[0m')
+
+
+class RobocasaGCGDataset(GCGBaseDataset):
+    def __init__(self, dataset_dir, tokenizer, global_image_encoder, epoch_samples=8000, precision="fp32", image_size=224, num_classes_per_sample=3, validation=False, random_sampling=True):
+        self.base_dir = os.path.join(dataset_dir, "GranDf")
+        json_files = {'validation': 'robocasa_GCG_val.json', 'training': 'robocasa_GCG_train.json'}
+        json_path = json_files['validation'] if validation else json_files['training']
+        image_dir = os.path.join(self.base_dir, "robocasa_images")
+        mode = "Val" if validation else "Train"
+        
+        super().__init__(
+            dataset_dir, tokenizer, global_image_encoder, epoch_samples, precision, image_size, num_classes_per_sample,
+            validation, random_sampling, image_dir, json_path, )
+        print('\033[92m' + "----GCG-{}: Robocasa-GCG dataset initialized----".format(mode) + '\033[0m')
 
 
 class OpenPsgGCGDataset(GCGBaseDataset):

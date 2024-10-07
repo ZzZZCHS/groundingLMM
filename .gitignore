@@ -9,3 +9,6 @@ attention.py
 GLaMM-FullScope/
 openai/
 mmcv/
+=2.12
+gpt
+tmp/

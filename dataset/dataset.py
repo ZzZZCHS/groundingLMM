@@ -8,7 +8,7 @@ from dataset.caption_datasets.LLavaInstruct_vqa_ds import LLaVAInstructDataset
 from dataset.region_datasets.Flickr_Region_ds import Flickr30kRegDataset
 from dataset.segm_datasets.Semantic_Segm_ds import SemanticSegmDataset
 from dataset.segm_datasets.RefCOCO_Segm_ds import ReferSegmDataset
-from dataset.gcg_datasets.GranDf_gcg_ds import GranDfDataset, OpenPsgGCGDataset, Flickr30kGCGDataset, RefCOCOgGCGDataset
+from dataset.gcg_datasets.GranDf_gcg_ds import GranDfDataset, OpenPsgGCGDataset, Flickr30kGCGDataset, RefCOCOgGCGDataset, RobocasaGCGDataset
 from dataset.region_datasets.RefCOCO_VG_Region_ds import (RefCocoRegDataset, RefCocoGRegDataset, RefCocoPRegDataset,
                                                           VisualGenomeRegDataset)
 from dataset.caption_datasets.GranD_ShortCaption_ds import GrandShortCaptionDataset
@@ -126,6 +126,7 @@ class HybridSegDataset(HybridDatasetBase):
                            "GranDf_GCG": GranDfDataset,
                            "Flickr_GCG": Flickr30kGCGDataset,
                            "GrandRefer_Segm": GrandReferSegmDataset,
+                           "Robocasa_GCG": RobocasaGCGDataset
                            # Add other dataset mappings here
                            }
         super().__init__(

@@ -14,6 +14,7 @@ from model.llava import conversation as conversation_lib
 from model.llava.mm_utils import tokenizer_image_token
 from model.SAM.utils.transforms import ResizeLongestSide
 from tools.utils import DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
+from spacy_utils import extract_direct_object_phrases
 
 
 def parse_args():
@@ -23,6 +24,7 @@ def parse_args():
     parser.add_argument("--img_dir", required=False, default="./data/GranDf/GranDf_HA_images/val_test",
                         help="The directory containing images to run inference.")
     parser.add_argument("--output_dir", required=True, help="The directory to store the response in json format.")
+    parser.add_argument("--anno_path", required=True, help="The val annotation file path")
 
     parser.add_argument("--image_size", default=1024, type=int, help="image size")
     parser.add_argument("--model_max_length", default=512, type=int)
@@ -102,8 +104,8 @@ def inference(instructions, image_path):
 def custom_collate_fn(batch):
     image_id = [item[0] for item in batch]
     image_path = [item[1] for item in batch]
-
-    return image_id, image_path
+    prompt = [item[2] for item in batch]
+    return image_id, image_path, prompt
 
 
 if __name__ == "__main__":
@@ -142,25 +144,33 @@ if __name__ == "__main__":
     model.eval()  # Model should be in evaluation mode for inference
 
     # Prompt model to return grounded conversations
-    instruction = "Could you please give me a detailed description of the image? Please respond with interleaved \
+    instruction = "Please respond with interleaved \
     segmentation masks for the corresponding parts of the answer."
 
     # Create output directory if not exists already
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Create DDP Dataset
-    dataset = GCGEvalDDP(args.img_dir)
+    dataset = RobocasaGCGEvalDDP(args.img_dir, args.anno_path)
     distributed_sampler = DistributedSampler(dataset, rank=args.rank, shuffle=False)
     dataloader = DataLoader(dataset, batch_size=args.batch_size_per_gpu, num_workers=2,
                             sampler=distributed_sampler, collate_fn=custom_collate_fn)
 
     # Iterate over all the images, run inference and save results
-    for (image_id, image_path) in tqdm(dataloader):
-        image_id, image_path = image_id[0], image_path[0]
+    for (image_id, image_path, prompt) in tqdm(dataloader):
+        image_id, image_path, prompt = image_id[0], image_path[0], prompt[0]
 
         output_path = f"{args.output_dir}/{image_id[:-4]}.json"
-
-        result_caption, pred_masks, phrases = inference(instruction, image_path)  # GLaMM Inference
+        tmp_instruction = prompt + ' ' + instruction
+        
+        # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        # ori_instruction = prompt.split('instruction: ')[-1]
+        # phrases = extract_direct_object_phrases(ori_instruction)
+        # phrase = phrases[0] if len(phrases) > 0 else "the object"
+        # tmp_instruction = f"Can you segment {phrase}?"
+        # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        
+        result_caption, pred_masks, phrases = inference(tmp_instruction, image_path)  # GLaMM Inference
 
         # Convert the predicted masks into RLE format
         pred_masks_tensor = pred_masks[0].cpu()
