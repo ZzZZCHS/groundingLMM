@@ -7,8 +7,11 @@ data
 attention.py
 *.png
 GLaMM-FullScope/
+GLaMM-GCG/
+GLaMM-GranD-Pretrained/
 openai/
 mmcv/
-=2.12
 gpt
 tmp/
+infer_results/
+save_images/

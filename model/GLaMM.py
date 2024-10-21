@@ -5,6 +5,9 @@ import torch.nn.functional as F
 
 from model.SAM import build_sam_vit_h
 from model.llava.model.language_model.llava_llama import LlavaLlamaForCausalLM, LlavaLlamaModel
+from model.policy.algo.bc import BC_Transformer_GMM
+import time
+from tools.utils import dict_to_bfloat16
 
 
 def calculate_dice_loss(predictions: torch.Tensor, ground_truth: torch.Tensor, mask_count: float, scale_factor=1000,
@@ -133,8 +136,15 @@ class GLaMMForCausalLM(LlavaLlamaForCausalLM):
     def model_forward(self, global_enc_images: torch.FloatTensor, grounding_enc_images: torch.FloatTensor,
                       bboxes: torch.FloatTensor, input_ids: torch.LongTensor, labels: torch.LongTensor,
                       attention_masks: torch.LongTensor, offset: torch.LongTensor, masks_list: List[torch.FloatTensor],
-                      label_list: List[torch.Tensor], resize_list: List[tuple], inference: bool = False, **kwargs, ):
+                      label_list: List[torch.Tensor], resize_list: List[tuple], inference: bool = False, 
+                      policy_net=None, batch_meta=None, **kwargs, ):
 
+        # print(kwargs["sampled_classes_list"])
+        # if batch_meta is not None:
+        #     print(batch_meta.keys())
+        #     print(batch_meta["obs"]["lang_emb"].dtype)
+        #     print(batch_meta["obs"]["robot0_agentview_left_image"].dtype)
+        #     breakpoint()
         # Handle inference or training paths
         if inference:
             output_hidden_states = self._inference_path(input_ids, global_enc_images, attention_masks)
@@ -162,9 +172,33 @@ class GLaMMForCausalLM(LlavaLlamaForCausalLM):
                 return {"pred_masks": pred_masks, "gt_masks": masks_list, }
         else:
             pred_masks = None
-
-        # Calculate losses
-        return self._calculate_losses(pred_masks, masks_list, output)
+        
+        # print(len(pred_masks), pred_masks[0].shape, pred_embeddings[0].shape, pred_masks[1].shape, pred_embeddings[1].shape)
+        # breakpoint()
+        
+        losses = self._calculate_losses(pred_masks, masks_list, output)
+        
+        if batch_meta is not None:
+            batch_meta = policy_net.process_batch_for_training(batch_meta)
+            batch_meta = policy_net.postprocess_batch_for_training(batch_meta)
+            batch_meta = dict_to_bfloat16(batch_meta)
+            
+            for i in range(len(pred_embeddings)):
+                if pred_embeddings[i].shape[0] == 1:
+                    pred_embeddings[i] = pred_embeddings[i].repeat(2, 1)
+                    # pred_embeddings[i][1:] = 0
+            pred_embeddings = torch.stack(pred_embeddings, dim=0)
+            pred_embeddings = pred_embeddings / pred_embeddings.norm()
+            pred_embeddings = pred_embeddings.flatten(1, 2)
+            seq_len = batch_meta["obs"]["lang_emb"].shape[1]
+            pred_embeddings = pred_embeddings.unsqueeze(1).repeat(1, seq_len, 1)
+            
+            policy_predictions = policy_net._forward_training(batch_meta, mask_embeds=pred_embeddings)
+            policy_loss = policy_net._compute_losses(policy_predictions, batch_meta)
+            losses["loss"] += policy_loss
+            losses["policy_loss"] = policy_loss
+            
+        return losses
 
     def _create_seg_token_mask(self, input_ids):
         mask = input_ids[:, 1:] == self.seg_token_idx
@@ -223,6 +257,9 @@ class GLaMMForCausalLM(LlavaLlamaForCausalLM):
         for i in range(len(seg_token_offset) - 1):
             start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
             pred_embeddings_list.append(pred_embeddings[start_i:end_i])
+        
+        # print(pred_embeddings_list[0].shape, hidden_states[0].shape, len(pred_embeddings_list), seg_token_mask.shape, device, pred_embeddings.shape, seg_token_counts)
+        # breakpoint()
         return hidden_states, pred_embeddings_list
 
     def _generate_and_postprocess_masks(self, pred_embeddings, image_embeddings, resize_list, label_list, infer=False):
@@ -309,3 +346,25 @@ class GLaMMForCausalLM(LlavaLlamaForCausalLM):
                 predicted_embeddings, image_embeddings, resize_list, orig_sizes, infer=True
             )
         return generated_output_ids, pred_masks
+
+
+class GLaMMWithPolicy(nn.Module):
+    def __init__(self, glamm_version, glamm_model_args, obs_key_shapes, ac_dim, policy_config):
+        super().__init__()
+        self.glamm_model = GLaMMForCausalLM.from_pretrained(
+            glamm_version, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, **glamm_model_args
+        )
+        self.policy_net = BC_Transformer_GMM(
+            algo_config=policy_config.algo,
+            obs_config=policy_config.observation,
+            global_config=policy_config,
+            obs_key_shapes=obs_key_shapes,
+            ac_dim=ac_dim,
+            device='cpu'
+        )
+    
+    def forward(self, **kwargs):
+        return self.glamm_model(policy_net=self.policy_net, **kwargs)
+    
+    def evaluate(self, **kwargs):
+        return self.glamm_model.evaluate(**kwargs)

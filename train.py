@@ -14,22 +14,27 @@ import argparse
 import deepspeed
 import numpy as np
 import transformers
+import glob
+import json
 from functools import partial
 from torch.utils.data import ConcatDataset
 from peft import LoraConfig, get_peft_model
 from torch.utils.tensorboard import SummaryWriter
 
-from model.GLaMM import GLaMMForCausalLM
+from model.GLaMM import GLaMMForCausalLM, GLaMMWithPolicy
 from model.llava import conversation as conversation_lib
 
-from dataset.dataset import custom_collate_fn, HybridSegDataset, HybridRegDataset, HybridCapDataset
-from tools.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, AverageMeter, ProgressMeter, dict_to_cuda,
-                         Summary, intersectionAndUnionGPU)
+from dataset.dataset import custom_collate_fn, gvla_custom_collate_fn, HybridSegDataset, HybridRegDataset, HybridCapDataset
+from tools.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, AverageMeter, ProgressMeter, dict_to_cuda, dict_to_bfloat16, Summary, intersectionAndUnionGPU)
 
 from dataset.segm_datasets.RefCOCO_Segm_ds import ReferSegmDataset
 from dataset.region_datasets.RefCOCO_VG_Region_ds import RefCocoGRegDataset, VisualGenomeRegDataset
 from dataset.caption_datasets.COCO_Caption_ds import CocoCapDataset
-from dataset.gcg_datasets.GranDf_gcg_ds import OpenPsgGCGDataset, Flickr30kGCGDataset, RefCOCOgGCGDataset
+from dataset.gcg_datasets.GranDf_gcg_ds import OpenPsgGCGDataset, Flickr30kGCGDataset, RefCOCOgGCGDataset, RobocasaGCGDataset
+from dataset.gvla_datasets.grounded_vla_ds import GroundedVLADataset, GroundedVLAMetaDataset
+from config import config_factory
+import tools.file_utils as FileUtils
+import tools.obs_utils as ObsUtils
 
 
 def parse_args(args):
@@ -51,11 +56,13 @@ def parse_args(args):
     parser.add_argument("--mm_vision_select_layer", default=-2, type=int)
     parser.add_argument("--pretrain_mm_mlp_adapter", default="", type=str)
     parser.add_argument("--precision", default='bf16', type=str)
+    parser.add_argument("--policy_config", default=None, type=str)
 
     # Dataset settings
     parser.add_argument("--use_cap_data", action="store_true", help="Use caption data")
     parser.add_argument("--use_reg_data", action="store_true", help="Use region data")
     parser.add_argument("--use_segm_data", action="store_true", help="Use segmentation data")
+    parser.add_argument("--use_gvla_data", action="store_true", help="Use groundedvla data")
     parser.add_argument("--weight_cap", default=0.15, type=float, help="Sampling weight for caption data")
     parser.add_argument("--weight_reg", default=0.40, type=float, help="Sampling weight for region data")
     parser.add_argument("--weight_segm", default=0.45, type=float, help="Sampling weight for segmentation data")
@@ -69,10 +76,13 @@ def parse_args(args):
     parser.add_argument("--cap_dataset", default="CocoCap||LLaVaInstruct", type=str,
                         help="Choose from: CocoCap, LLaVaInstruct, GrandCaptionDataset")
     parser.add_argument("--cap_sample_rates", default="1,1", type=str)
+    # parser.add_argument("--gvla_dataset", default="Robocasa_GVLA", type=str)
+    # parser.add_argument("--gvla_sample_rates", default="1", type=str)
     parser.add_argument("--semantic_segm_data", default="ade20k||cocostuff||pascal_part||paco_lvis||mapillary", type=str)
     parser.add_argument("--refer_segm_data", default="refcoco||refcoco+||refcocog||refclef", type=str)
     parser.add_argument("--vqa_data", default="llava_instruct_150k", type=str)
     parser.add_argument("--num_classes_per_sample", default=3, type=int)
+    parser.add_argument("--raw_data_dir", default=None, type=str, help="raw data dir of the hdf5 files")
 
     # Training settings
     parser.add_argument("--pretrained", action="store_true")
@@ -112,6 +122,7 @@ def parse_args(args):
     # Experiment settings
     parser.add_argument("--log_base_dir", default="./output", type=str)
     parser.add_argument("--exp_name", default="GlamFinetuneOS", type=str)
+    parser.add_argument("--debug", action="store_true")
 
     return parser.parse_args(args)
 
@@ -155,7 +166,7 @@ def setup_tokenizer_and_special_tokens(args):
     return tokenizer
 
 
-def initialize_model(args, tokenizer):
+def initialize_model(args, tokenizer, policy_config):
     """ Initialize the GLaMM model. """
     model_args = {k: getattr(args, k) for k in
                   ["train_mask_decoder", "out_dim", "ce_loss_weight", "dice_loss_weight", "bce_loss_weight",
@@ -164,23 +175,49 @@ def initialize_model(args, tokenizer):
                    "with_region", "bbox_token_idx", "eop_token_idx", "bop_token_idx"]}
     model_args["num_level_reg_features"] = 4
 
-    model = GLaMMForCausalLM.from_pretrained(
-        args.version, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, **model_args
-    )
+    if policy_config is None:
+        model = GLaMMForCausalLM.from_pretrained(
+            args.version, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, **model_args
+        )
+        
+        # Configure model tokens
+        model.config.eos_token_id = tokenizer.eos_token_id
+        model.config.bos_token_id = tokenizer.bos_token_id
+        model.config.pad_token_id = tokenizer.pad_token_id
+    else:
+        ObsUtils.initialize_obs_utils_with_config(policy_config)
+        shape_meta = FileUtils.get_shape_metadata_from_dataset(
+            dataset_path=policy_config.train.data[0]["path"],
+            action_keys=policy_config.train.action_keys,
+            all_obs_keys=policy_config.all_obs_keys,
+            ds_format=policy_config.train.data_format,
+            verbose=False
+        )
+        model = GLaMMWithPolicy(
+            glamm_version=args.version, 
+            glamm_model_args=model_args, 
+            obs_key_shapes=shape_meta["all_shapes"],
+            ac_dim=shape_meta["ac_dim"],
+            policy_config=policy_config
+        )
+        # Configure model tokens
+        model.glamm_model.config.eos_token_id = tokenizer.eos_token_id
+        model.glamm_model.config.bos_token_id = tokenizer.bos_token_id
+        model.glamm_model.config.pad_token_id = tokenizer.pad_token_id
     print('\033[92m' + "---- Initialized model from: {} ----".format(args.version) + '\033[0m')
-
-    # Configure model tokens
-    model.config.eos_token_id = tokenizer.eos_token_id
-    model.config.bos_token_id = tokenizer.bos_token_id
-    model.config.pad_token_id = tokenizer.pad_token_id
 
     return model
 
 
-def prepare_model_for_training(model, tokenizer, args):
+def prepare_model_for_training(model, tokenizer, args, policy_config):
     # Enable input gradients
-    model.enable_input_require_grads()
-    model.gradient_checkpointing_enable()
+    if policy_config:
+        glamm_model = model.glamm_model
+    else:
+        glamm_model = model
+    
+    glamm_model.enable_input_require_grads()
+    glamm_model.gradient_checkpointing_enable()
 
     # Initialize vision tower
     print(
@@ -188,38 +225,38 @@ def prepare_model_for_training(model, tokenizer, args):
             args.vision_tower
         ) + '\033[0m'
     )
-    model.get_model().initialize_vision_modules(model.get_model().config)
-    vision_tower = model.get_model().get_vision_tower()
+    glamm_model.get_model().initialize_vision_modules(glamm_model.get_model().config)
+    vision_tower = glamm_model.get_model().get_vision_tower()
     vision_tower.to(dtype=torch.bfloat16, device=args.local_rank)
 
     # Initialize GLaMM model and adjust requires_grad
     if not args.pretrained:
-        model.get_model().initialize_glamm_model(model.get_model().config)
+        glamm_model.get_model().initialize_glamm_model(glamm_model.get_model().config)
     else:
-        for param in model.get_model().grounding_encoder.parameters():
+        for param in glamm_model.get_model().grounding_encoder.parameters():
             param.requires_grad = False
-        if model.get_model().config.train_mask_decoder:
-            model.get_model().grounding_encoder.mask_decoder.train()
-            for param in model.get_model().grounding_encoder.mask_decoder.parameters():
+        if glamm_model.get_model().config.train_mask_decoder:
+            glamm_model.get_model().grounding_encoder.mask_decoder.train()
+            for param in glamm_model.get_model().grounding_encoder.mask_decoder.parameters():
                 param.requires_grad = True
 
         # Projection layer
-        model.get_model().text_hidden_fcs.train()
-        for param in model.get_model().text_hidden_fcs.parameters():
+        glamm_model.get_model().text_hidden_fcs.train()
+        for param in glamm_model.get_model().text_hidden_fcs.parameters():
             param.requires_grad = True
 
     # Set requires_grad for vision tower and mm projector
     for p in vision_tower.parameters():
         p.requires_grad = False
-    for p in model.get_model().mm_projector.parameters():
+    for p in glamm_model.get_model().mm_projector.parameters():
         p.requires_grad = False
 
     # Set requires_grad based on LoRA training
     lora_r = args.lora_r
     if lora_r == 0:
-        for p in model.get_model().layers.parameters():
+        for p in glamm_model.get_model().layers.parameters():
             p.requires_grad = True
-        for p in model.get_model().mm_projector.parameters():
+        for p in glamm_model.get_model().mm_projector.parameters():
             p.requires_grad = True
 
     # Configure conversation library
@@ -227,11 +264,16 @@ def prepare_model_for_training(model, tokenizer, args):
 
     # Configure LoRA if applicable
     if lora_r > 0:
-        lora_config = setup_lora_config(model, args)
-        model = get_peft_model(model, lora_config)
+        if policy_config:
+            lora_config = setup_lora_config(glamm_model, args)
+            model.glamm_model = get_peft_model(glamm_model, lora_config)
+            glamm_model = model.glamm_model
+        else:
+            lora_config = setup_lora_config(model, args)
+            model = get_peft_model(model, lora_config)
 
     # Resize token embeddings
-    model.resize_token_embeddings(len(tokenizer))
+    glamm_model.resize_token_embeddings(len(tokenizer))
 
     # Make certain modules trainable
     set_trainable_modules(model)
@@ -265,7 +307,7 @@ def setup_lora_config(model, args):
 
 def set_trainable_modules(model):
     """ Make specified modules in the model trainable. """
-    trainable_modules = ["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs", "region_encoder"]
+    trainable_modules = ["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs", "region_encoder", "policy_net"]
     for name, param in model.named_parameters():
         if any(module in name for module in trainable_modules):
             print(f"Making trainable: {name}, Shape: {param.shape}")
@@ -291,7 +333,7 @@ def initialize_datasets_and_loaders(args, tokenizer):
                       "epoch_samples": args.batch_size * args.grad_accumulation_steps * args.steps_per_epoch * world_size,
                       "precision": args.precision, "image_size": args.image_size,
                       "num_classes_per_sample": args.num_classes_per_sample}
-
+    
     # Training datasets
     cap_train_dataset = HybridCapDataset(
         **common_ds_args, dataset=args.cap_dataset, sample_rate=[float(x) for x in args.cap_sample_rates.split(",")],
@@ -303,18 +345,32 @@ def initialize_datasets_and_loaders(args, tokenizer):
         **common_ds_args, dataset=args.seg_dataset, sample_rate=[float(x) for x in args.segm_sample_rates.split(",")],
         semantic_segm_data=args.semantic_segm_data, refer_segm_data=args.refer_segm_data,
         batch_size=args.batch_size, ) if args.use_segm_data else None
+    
+    if args.use_gvla_data:
+        gvla_datasets = []
+        for hdf5_path in glob.glob(os.path.join(args.raw_data_dir, "*.hdf5")):
+            gvla_dataset = GroundedVLADataset(**common_ds_args, hdf5_path=hdf5_path, raw_data_dir=args.raw_data_dir)
+            gvla_datasets.append(gvla_dataset)
+            if args.debug:
+                break
+        gvla_train_dataset = GroundedVLAMetaDataset(gvla_datasets)
+    else:
+        gvla_train_dataset = None
+    
 
     # Validation datasets
     val_datasets = []
     if not args.no_eval:
-        val_dataset_classes = {'CocoCapVal': CocoCapDataset,
-                               'RefCOCOgRegVal': RefCocoGRegDataset,
-                               'VisGenomeRegVal': VisualGenomeRegDataset,
-                               'RefCOCOgSegmVal': ReferSegmDataset,
-                               'PsgGCGVal': OpenPsgGCGDataset,
-                               'RefCocoGCGVal': RefCOCOgGCGDataset,
-                               'FlickrGCGVal': Flickr30kGCGDataset,
-                               }
+        val_dataset_classes = {
+            'CocoCapVal': CocoCapDataset,
+            'RefCOCOgRegVal': RefCocoGRegDataset,
+            'VisGenomeRegVal': VisualGenomeRegDataset,
+            'RefCOCOgSegmVal': ReferSegmDataset,
+            'PsgGCGVal': OpenPsgGCGDataset,
+            'RefCocoGCGVal': RefCOCOgGCGDataset,
+            'FlickrGCGVal': Flickr30kGCGDataset,
+            'Robocasa_GCG': RobocasaGCGDataset
+        }
         for val_dataset_name in args.val_dataset.split('|'):
             val_dataset_class = val_dataset_classes.get(val_dataset_name)
             if val_dataset_class:
@@ -331,10 +387,10 @@ def initialize_datasets_and_loaders(args, tokenizer):
                 else:
                     val_datasets.append(val_dataset_class(**common_ds_args, validation=True))
 
-    return cap_train_dataset, reg_train_dataset, seg_train_dataset, val_datasets
+    return cap_train_dataset, reg_train_dataset, seg_train_dataset, gvla_train_dataset, val_datasets
 
 
-def setup_data_loaders(args, cap_train_dataset, reg_train_dataset, seg_train_dataset, val_datasets, tokenizer):
+def setup_data_loaders(args, cap_train_dataset, reg_train_dataset, seg_train_dataset, gvla_train_dataset, val_datasets, tokenizer):
     sampler_args = {"shuffle": False, "drop_last": False}
     train_loader_args = {"batch_size": args.batch_size, "shuffle": False, "num_workers": args.workers,
                          "pin_memory": False}
@@ -342,6 +398,10 @@ def setup_data_loaders(args, cap_train_dataset, reg_train_dataset, seg_train_dat
                        "pin_memory": False}
     collate_fn_args_train = partial(
         custom_collate_fn, tokenizer=tokenizer, use_mm_start_end=args.use_mm_start_end, local_rank=args.local_rank,
+        inference=False
+    )
+    gvla_collate_fn_args_train = partial(
+        gvla_custom_collate_fn, tokenizer=tokenizer, use_mm_start_end=args.use_mm_start_end, local_rank=args.local_rank,
         inference=False
     )
     inference_mode = args.mask_validation
@@ -366,6 +426,11 @@ def setup_data_loaders(args, cap_train_dataset, reg_train_dataset, seg_train_dat
             seg_train_dataset, **sampler_args
         ), collate_fn=collate_fn_args_train, **train_loader_args
     ) if seg_train_dataset is not None else None
+    gvla_train_loader = torch.utils.data.DataLoader(
+        gvla_train_dataset, sampler=torch.utils.data.distributed.DistributedSampler(
+            gvla_train_dataset, **sampler_args
+        ), collate_fn=gvla_collate_fn_args_train, **train_loader_args
+    ) if gvla_train_dataset is not None else None
 
     # Validation loader
     val_loader = None
@@ -375,7 +440,7 @@ def setup_data_loaders(args, cap_train_dataset, reg_train_dataset, seg_train_dat
             combined_val_datasets, **val_loader_args, collate_fn=collate_fn_args_val,
             sampler=torch.utils.data.distributed.DistributedSampler(combined_val_datasets, **sampler_args), )
 
-    return cap_train_loader, reg_train_loader, seg_train_loader, val_loader
+    return cap_train_loader, reg_train_loader, seg_train_loader, gvla_train_loader, val_loader
 
 
 def initialize_deepspeed(model, tokenizer, args):
@@ -416,17 +481,25 @@ def resume_training_from_checkpoint(model_engine, args):
 
 
 def main(args):
+    if args.policy_config is not None:
+        ext_cfg = json.load(open(args.policy_config, 'r'))
+        policy_config = config_factory(ext_cfg["algo_name"])
+        with policy_config.values_unlocked():
+            policy_config.update(ext_cfg)
+    else:
+        policy_config = None
     tokenizer = setup_tokenizer_and_special_tokens(args)
-    model = initialize_model(args, tokenizer)
-    prepare_model_for_training(model, tokenizer, args)
+    
+    model = initialize_model(args, tokenizer, policy_config)
+    prepare_model_for_training(model, tokenizer, args, policy_config)
 
     model_engine, optimizer, scheduler = initialize_deepspeed(model, tokenizer, args)
     resume_training_from_checkpoint(model_engine, args)
 
-    cap_train_dataset, reg_train_dataset, seg_train_dataset, val_datasets = (
+    cap_train_dataset, reg_train_dataset, seg_train_dataset, gvla_train_dataset, val_datasets = (
         initialize_datasets_and_loaders(args, tokenizer))
-    cap_train_loader, reg_train_loader, seg_train_loader, val_loader = (
-        setup_data_loaders(args, cap_train_dataset, reg_train_dataset, seg_train_dataset, val_datasets, tokenizer))
+    cap_train_loader, reg_train_loader, seg_train_loader, gvla_train_loader, val_loader = (
+        setup_data_loaders(args, cap_train_dataset, reg_train_dataset, seg_train_dataset, gvla_train_dataset, val_datasets, tokenizer))
 
     # Determine active datasets and their weights
     active_dataloaders = []
@@ -448,6 +521,7 @@ def main(args):
     dataset_iters = {'cap': iter(cap_train_loader) if args.use_cap_data else None,
                      'reg': iter(reg_train_loader) if args.use_reg_data else None,
                      'seg': iter(seg_train_loader) if args.use_segm_data else None, }
+    gvla_dataset_iter = iter(gvla_train_loader) if args.use_gvla_data else None
 
     writer = initialize_environment(args)
 
@@ -464,8 +538,8 @@ def main(args):
 
         step_choices = random.choices(dataset_choices, weights=weights, k=args.steps_per_epoch)
 
-        dataset_iters = train(
-            active_dataloaders, model_engine, epoch, scheduler, writer, dataset_iters, args, step_choices
+        dataset_iters, gvla_dataset_iter = train(
+            active_dataloaders, model_engine, epoch, scheduler, writer, dataset_iters, gvla_dataset_iter, args, step_choices, gvla_train_loader
         )
 
         if args.mask_validation:
@@ -501,7 +575,7 @@ def save_checkpoint(model_engine, args, epoch, metric_name, metric_value, is_bes
     model_engine.save_checkpoint(save_dir)
 
 
-def train(active_datasets, model, epoch, scheduler, writer, dataset_iters, args, step_choices):
+def train(active_datasets, model, epoch, scheduler, writer, dataset_iters, gvla_dataset_iter, args, step_choices, gvla_train_loader):
     """Main training loop."""
 
     def get_next_input(iterator, data_loader):
@@ -535,7 +609,8 @@ def train(active_datasets, model, epoch, scheduler, writer, dataset_iters, args,
                 "ce_loss": AverageMeter("CeLoss", ":.4f"),
                 "mask_bce_loss": AverageMeter("MaskBCELoss", ":.4f"),
                 "mask_dice_loss": AverageMeter("MaskDICELoss", ":.4f"),
-                "mask_loss": AverageMeter("MaskLoss", ":.4f")}
+                "mask_loss": AverageMeter("MaskLoss", ":.4f"),
+                "policy_loss": AverageMeter("PolicyLoss", ":.4f")}
     progress = ProgressMeter(args.steps_per_epoch, list(trackers.values()), prefix=f"Epoch: [{epoch}]")
 
     model.train()
@@ -543,9 +618,13 @@ def train(active_datasets, model, epoch, scheduler, writer, dataset_iters, args,
     for global_step in range(args.steps_per_epoch):
         for _ in range(args.grad_accumulation_steps):
             # Select data loader based on step choice
-            dataset_type, data_loader = active_datasets[step_choices[global_step]]
-            data_batch, new_iter = get_next_input(dataset_iters[dataset_type], data_loader)
-            dataset_iters[dataset_type] = new_iter
+            if args.use_gvla_data is not None and _ % 2 == 1:
+                data_batch, new_iter = get_next_input(gvla_dataset_iter, gvla_train_loader)
+                gvla_dataset_iter = new_iter
+            else:
+                dataset_type, data_loader = active_datasets[step_choices[global_step]]
+                data_batch, new_iter = get_next_input(dataset_iters[dataset_type], data_loader)
+                dataset_iters[dataset_type] = new_iter
 
             data_time.update(time.time() - end)
             # Prepare data and convert relevant tensors to bfloat16
@@ -553,6 +632,8 @@ def train(active_datasets, model, epoch, scheduler, writer, dataset_iters, args,
             for key in ["global_enc_images", "grounding_enc_images"]:
                 if data_batch[key] is not None:
                     data_batch[key] = data_batch[key].bfloat16()
+            # if "batch_meta" in data_batch:
+            #     data_batch["batch_meta"] = dict_to_bfloat16(data_batch["batch_meta"])
 
             output_dict = model(**data_batch)
 
@@ -573,7 +654,7 @@ def train(active_datasets, model, epoch, scheduler, writer, dataset_iters, args,
             if args.local_rank == 0:
                 writer.add_scalar("train/lr", curr_lr[0], global_step)
 
-    return dataset_iters
+    return dataset_iters, gvla_dataset_iter
 
 
 def validate_model_performance(validation_loader, training_model, current_epoch, tensorboard_writer, args):

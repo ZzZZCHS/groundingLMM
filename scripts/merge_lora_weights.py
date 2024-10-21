@@ -50,7 +50,7 @@ def main():
 
     # Initialize the tokenizer and model
     tokenizer = setup_tokenizer_and_special_tokens(args)
-    model = initialize_model(args, tokenizer)
+    model = initialize_model(args, tokenizer, policy_config=None)
     model.get_model().initialize_vision_modules(model.get_model().config)
     vision_tower = model.get_model().get_vision_tower()
     vision_tower.to(dtype=torch.bfloat16)

@@ -27,7 +27,7 @@ class GCGBaseDataset(torch.utils.data.Dataset):
 
     def __init__(self, dataset_dir, tokenizer, global_image_encoder, epoch_samples=8000, precision="fp32",
                  image_size=224, num_classes_per_sample=3, validation=False, random_sampling=True,
-                 image_dir='', json_path=''):
+                 image_dir='', json_path='', **kwargs):
         self.epoch_samples = epoch_samples
         self.num_classes_per_sample = num_classes_per_sample
         self.dataset_dir = dataset_dir
@@ -45,10 +45,12 @@ class GCGBaseDataset(torch.utils.data.Dataset):
 
         # Defining paths
         self.base_dir = os.path.join(dataset_dir, "GranDf")
-        self.image_folder = os.path.join(image_dir)
-        self.ann_file = os.path.join(self.base_dir, "annotations", "train", json_path)
-        self.data_infos = self._load_annotations(self.ann_file)
-
+        if json_path and image_dir:
+            self.image_folder = os.path.join(image_dir)
+            self.ann_file = os.path.join(self.base_dir, "annotations", "train", json_path)
+            self.data_infos = self._load_annotations(self.ann_file)
+        # else
+            
     def _load_annotations(self, ann_file):
         with open(ann_file, 'r') as f:
             data_infos = json.load(f)
@@ -190,7 +192,8 @@ class RobocasaGCGDataset(GCGBaseDataset):
         self.base_dir = os.path.join(dataset_dir, "GranDf")
         json_files = {'validation': 'robocasa_GCG_val.json', 'training': 'robocasa_GCG_train.json'}
         json_path = json_files['validation'] if validation else json_files['training']
-        image_dir = os.path.join(self.base_dir, "robocasa_images")
+        # image_dir = os.path.join(self.base_dir, "robocasa_images")
+        image_dir = "data/robocasa_datasets/v0.1/generated_1013/images"
         mode = "Val" if validation else "Train"
         
         super().__init__(

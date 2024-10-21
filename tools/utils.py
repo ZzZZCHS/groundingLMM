@@ -132,4 +132,14 @@ def dict_to_cuda(input_dict):
             input_dict[k] = v.cuda(non_blocking=True)
         elif isinstance(v, list) and len(v) > 0:
             input_dict[k] = [ele.cuda(non_blocking=True) if isinstance(ele, torch.Tensor) else ele for ele in v]
+        elif isinstance(v, dict):
+            input_dict[k] = dict_to_cuda(v)
+    return input_dict
+
+def dict_to_bfloat16(input_dict):
+    for k, v in input_dict.items():
+        if isinstance(v, torch.Tensor):
+            input_dict[k] = v.bfloat16()
+        elif isinstance(v, dict):
+            input_dict[k] = dict_to_bfloat16(v)
     return input_dict
