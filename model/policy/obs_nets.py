@@ -219,7 +219,7 @@ class ObservationEncoder(Module):
         if self.feature_activation is not None:
             self.activation = self.feature_activation()
 
-    def forward(self, obs_dict, mask_embeds):
+    def forward(self, obs_dict, mask_embeds=None):
         """
         Processes modalities according to the ordering in @self.obs_shapes. For each
         modality, it is processed with a randomizer (if present), an encoder
@@ -264,7 +264,7 @@ class ObservationEncoder(Module):
             for rand in self.obs_randomizers[k]:
                 if rand is not None:
                     x = rand.forward_out(x)
-            if k == "robot0_agentview_left_image":
+            if k == "robot0_agentview_left_image" and mask_embeds is not None:
                 # print(k, x.abs().mean(), mask_embeds.abs().mean())
                 # breakpoint()
                 x = x + mask_embeds
@@ -714,7 +714,8 @@ class MIMO_Transformer(Module):
 
         inputs = inputs.copy()
         
-        inputs["mask_embeds"] = self.mask2obs_projector(inputs["mask_embeds"])
+        if inputs["mask_embeds"] is not None:
+            inputs["mask_embeds"] = self.mask2obs_projector(inputs["mask_embeds"])
         transformer_encoder_outputs = None
         transformer_inputs = TensorUtils.time_distributed(
             inputs, self.nets["encoder"], inputs_as_kwargs=True

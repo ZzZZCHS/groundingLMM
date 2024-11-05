@@ -44,6 +44,9 @@ OBS_MODALITY_CLASSES = {}
 OBS_ENCODER_CORES = {"None": None}          # Include default None
 OBS_RANDOMIZERS = {"None": None}            # Include default None
 
+MASK_CHANNEL = 0
+DEPTH_CHANNEL = 0
+
 
 def register_obs_key(target_class):
     assert target_class not in OBS_MODALITY_CLASSES, f"Already registered modality {target_class}!"
@@ -234,6 +237,13 @@ def initialize_obs_utils_with_config(config):
     Args:
         config (BaseConfig instance): config object
     """
+    global MASK_CHANNEL, DEPTH_CHANNEL
+    if "addmask" in config.observation and config.observation.addmask == True:
+        if "masked_rgb" not in config.observation.modalities.obs or len(config.observation.modalities.obs.masked_rgb) == 0:
+            MASK_CHANNEL = 1
+    if "adddepth" in config.observation and config.observation.adddepth == True:
+        if "depth" not in config.observation.modalities.obs or len(config.observation.modalities.obs.depth) == 0:
+            DEPTH_CHANNEL = 1
     if config.algo_name == "hbc":
         obs_modality_specs = [
             config.observation.planner.modalities, 
@@ -279,7 +289,7 @@ def center_crop(im, t_h, t_w):
         im (np.array or torch.Tensor): center cropped image
     """
     assert(im.shape[-3] >= t_h and im.shape[-2] >= t_w)
-    assert(im.shape[-1] in [1, 3])
+    assert(im.shape[-1] in [1, 3, 4, 5])
     crop_h = int((im.shape[-3] - t_h) / 2)
     crop_w = int((im.shape[-2] - t_w) / 2)
     return im[..., crop_h:crop_h + t_h, crop_w:crop_w + t_w, :]
@@ -903,6 +913,7 @@ class ImageModality(Modality):
     Modality for RGB image observations
     """
     name = "rgb"
+    channel_dim = 3
 
     @classmethod
     def _default_obs_processor(cls, obs):
@@ -917,7 +928,17 @@ class ImageModality(Modality):
         Returns:
             processed_obs (np.array or torch.Tensor): processed image
         """
-        return process_frame(frame=obs, channel_dim=3, scale=255.)
+        add_channels = MASK_CHANNEL + DEPTH_CHANNEL
+        cls.channel_dim = 3 + add_channels
+        if obs.shape[-1] == 3 and add_channels > 0:
+            if isinstance(obs, np.ndarray):
+                obs = np.concatenate([obs, obs[..., -add_channels:]], axis=-1)
+            elif isinstance(obs, torch.Tensor):
+                obs = torch.concatenate([obs, obs[..., -add_channels:]], axis=-1)
+            else:
+                print(type(obs))
+        
+        return process_frame(frame=obs, channel_dim=cls.channel_dim, scale=255.)
 
     @classmethod
     def _default_obs_unprocessor(cls, obs):
@@ -932,7 +953,7 @@ class ImageModality(Modality):
             unprocessed_obs (np.array or torch.Tensor): image passed through
                 inverse operation of @process_frame
         """
-        return TU.to_uint8(unprocess_frame(frame=obs, channel_dim=3, scale=255.))
+        return TU.to_uint8(unprocess_frame(frame=obs, channel_dim=cls.channel_dim, scale=255.))
     
     
 class MaskedImageModality(Modality):
@@ -955,10 +976,11 @@ class MaskedImageModality(Modality):
         Returns:
             processed_obs (np.array or torch.Tensor): processed image
         """
-        if isinstance(obs, np.ndarray):
-            obs = np.expand_dims(obs, axis=-1)
-        if isinstance(obs, torch.Tensor):
-            obs = obs.unsqueeze(dim=-1)
+        if obs.shape[-1] not in VALID_IMAGE_CHANNEL_DIMS:
+            if isinstance(obs, np.ndarray):
+                obs = np.expand_dims(obs, axis=-1)
+            if isinstance(obs, torch.Tensor):
+                obs = obs.unsqueeze(dim=-1)
         return process_frame(frame=obs, channel_dim=1, scale=cls.scale)
 
     @classmethod

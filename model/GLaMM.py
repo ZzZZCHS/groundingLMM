@@ -4,7 +4,8 @@ from typing import List
 import torch.nn.functional as F
 
 from model.SAM import build_sam_vit_h
-from model.llava.model.language_model.llava_llama import LlavaLlamaForCausalLM, LlavaLlamaModel
+from model.llava.model.language_model.llava_llama import LlavaLlamaForCausalLM, LlavaLlamaModel, LlavaConfig
+from transformers import PreTrainedModel, PretrainedConfig, LlamaForCausalLM, LlamaPreTrainedModel
 from model.policy.algo.bc import BC_Transformer_GMM
 import time
 from tools.utils import dict_to_bfloat16
@@ -136,16 +137,7 @@ class GLaMMForCausalLM(LlavaLlamaForCausalLM):
     def model_forward(self, global_enc_images: torch.FloatTensor, grounding_enc_images: torch.FloatTensor,
                       bboxes: torch.FloatTensor, input_ids: torch.LongTensor, labels: torch.LongTensor,
                       attention_masks: torch.LongTensor, offset: torch.LongTensor, masks_list: List[torch.FloatTensor],
-                      label_list: List[torch.Tensor], resize_list: List[tuple], inference: bool = False, 
-                      policy_net=None, batch_meta=None, **kwargs, ):
-
-        # print(kwargs["sampled_classes_list"])
-        # if batch_meta is not None:
-        #     print(batch_meta.keys())
-        #     print(batch_meta["obs"]["lang_emb"].dtype)
-        #     print(batch_meta["obs"]["robot0_agentview_left_image"].dtype)
-        #     breakpoint()
-        # Handle inference or training paths
+                      label_list: List[torch.Tensor], resize_list: List[tuple], inference: bool = False, **kwargs):
         if inference:
             output_hidden_states = self._inference_path(input_ids, global_enc_images, attention_masks)
         else:
@@ -177,26 +169,6 @@ class GLaMMForCausalLM(LlavaLlamaForCausalLM):
         # breakpoint()
         
         losses = self._calculate_losses(pred_masks, masks_list, output)
-        
-        if batch_meta is not None:
-            batch_meta = policy_net.process_batch_for_training(batch_meta)
-            batch_meta = policy_net.postprocess_batch_for_training(batch_meta)
-            batch_meta = dict_to_bfloat16(batch_meta)
-            
-            for i in range(len(pred_embeddings)):
-                if pred_embeddings[i].shape[0] == 1:
-                    pred_embeddings[i] = pred_embeddings[i].repeat(2, 1)
-                    # pred_embeddings[i][1:] = 0
-            pred_embeddings = torch.stack(pred_embeddings, dim=0)
-            pred_embeddings = pred_embeddings / pred_embeddings.norm()
-            pred_embeddings = pred_embeddings.flatten(1, 2)
-            seq_len = batch_meta["obs"]["lang_emb"].shape[1]
-            pred_embeddings = pred_embeddings.unsqueeze(1).repeat(1, seq_len, 1)
-            
-            policy_predictions = policy_net._forward_training(batch_meta, mask_embeds=pred_embeddings)
-            policy_loss = policy_net._compute_losses(policy_predictions, batch_meta)
-            losses["loss"] += policy_loss
-            losses["policy_loss"] = policy_loss
             
         return losses
 
@@ -323,7 +295,7 @@ class GLaMMForCausalLM(LlavaLlamaForCausalLM):
                 "mask_dice_loss": mask_dice_loss, "mask_loss": mask_loss, }
 
     def evaluate(self, global_enc_images, grounding_enc_images, input_ids, resize_list, orig_sizes, max_tokens_new=32,
-                 bboxes=None, device="cuda:0"):
+                 bboxes=None, device="cuda:0", return_hidden_embedding=False):
         with torch.no_grad():
             generation_outputs = self.generate(
                 images=global_enc_images, input_ids=input_ids, bboxes=bboxes, max_new_tokens=max_tokens_new,
@@ -345,15 +317,22 @@ class GLaMMForCausalLM(LlavaLlamaForCausalLM):
             pred_masks = self._generate_and_postprocess_masks(
                 predicted_embeddings, image_embeddings, resize_list, orig_sizes, infer=True
             )
+        if return_hidden_embedding:
+            return generated_output_ids, pred_masks, predicted_embeddings
         return generated_output_ids, pred_masks
 
 
-class GLaMMWithPolicy(nn.Module):
-    def __init__(self, glamm_version, glamm_model_args, obs_key_shapes, ac_dim, policy_config):
-        super().__init__()
-        self.glamm_model = GLaMMForCausalLM.from_pretrained(
-            glamm_version, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, **glamm_model_args
-        )
+class GLaMMWithPolicy(LlamaPreTrainedModel):
+    def __init__(self, config, glamm_version, glamm_model_args, obs_key_shapes, ac_dim, policy_config, only_policy=False):
+        super().__init__(config)
+        if only_policy:
+            self.glamm_model = None
+        else:
+            if glamm_version is None:
+                glamm_version="/ailab/user/huanghaifeng/work/groundingLMM/GLaMM-GranD-Pretrained"
+            self.glamm_model = GLaMMForCausalLM.from_pretrained(
+                glamm_version, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, **glamm_model_args
+            )
         self.policy_net = BC_Transformer_GMM(
             algo_config=policy_config.algo,
             obs_config=policy_config.observation,
@@ -362,9 +341,78 @@ class GLaMMWithPolicy(nn.Module):
             ac_dim=ac_dim,
             device='cpu'
         )
-    
+        
     def forward(self, **kwargs):
-        return self.glamm_model(policy_net=self.policy_net, **kwargs)
+        return self.glamm_model.forward(**kwargs) if "past_key_values" in kwargs else self.model_forward(**kwargs)
+    
+    def model_forward(self, global_enc_images: torch.FloatTensor, grounding_enc_images: torch.FloatTensor,
+                      bboxes: torch.FloatTensor, input_ids: torch.LongTensor, labels: torch.LongTensor,
+                      attention_masks: torch.LongTensor, offset: torch.LongTensor, masks_list: List[torch.FloatTensor],
+                      label_list: List[torch.Tensor], resize_list: List[tuple], inference: bool = False, 
+                      batch_meta=None, only_policy=False, **kwargs, ):
+
+        losses = {}
+        if not only_policy:
+            
+            if inference:
+                output_hidden_states = self.glamm_model._inference_path(input_ids, global_enc_images, attention_masks)
+            else:
+                output, output_hidden_states = self.glamm_model._training_path(
+                    global_enc_images, bboxes, input_ids, labels, attention_masks, offset
+                )
+            if grounding_enc_images is not None:
+                # Extract grounding encoder image embeddings
+                image_embeddings = self.glamm_model.get_grounding_encoder_embs(grounding_enc_images)
+                assert image_embeddings.shape[0] == len(offset) - 1
+
+                # Create segmentation token mask
+                seg_token_mask = self.glamm_model._create_seg_token_mask(input_ids)
+
+                # Process hidden states
+                hidden_states, pred_embeddings = self.glamm_model._process_hidden_states(output_hidden_states, seg_token_mask, offset)
+
+                # Generate and post-process masks
+                pred_masks = self.glamm_model._generate_and_postprocess_masks(
+                    pred_embeddings, image_embeddings, resize_list, label_list
+                )
+
+                if inference:
+                    return {"pred_masks": pred_masks, "gt_masks": masks_list, }
+            else:
+                pred_masks = None
+            
+            # print(len(pred_masks), pred_masks[0].shape, pred_embeddings[0].shape, pred_masks[1].shape, pred_embeddings[1].shape)
+            # breakpoint()
+            
+            losses = self.glamm_model._calculate_losses(pred_masks, masks_list, output)
+        
+        if batch_meta is not None:
+            batch_meta = self.policy_net.process_batch_for_training(batch_meta)
+            batch_meta = self.policy_net.postprocess_batch_for_training(batch_meta)
+            batch_meta = dict_to_bfloat16(batch_meta)
+            
+            if not only_policy:
+                for i in range(len(pred_embeddings)):
+                    if pred_embeddings[i].shape[0] == 1:
+                        pred_embeddings[i] = pred_embeddings[i].repeat(2, 1)
+                        # pred_embeddings[i][1:] = 0
+                pred_embeddings = torch.stack(pred_embeddings, dim=0)
+                pred_embeddings = pred_embeddings / pred_embeddings.norm(dim=-1, keepdim=True)
+                pred_embeddings = pred_embeddings.flatten(1, 2)
+                seq_len = batch_meta["obs"]["lang_emb"].shape[1]
+                pred_embeddings = pred_embeddings.unsqueeze(1).repeat(1, seq_len, 1)
+            else:
+                pred_embeddings = None
+            
+            policy_predictions = self.policy_net._forward_training(batch_meta, mask_embeds=pred_embeddings)
+            policy_loss = self.policy_net._compute_losses(policy_predictions, batch_meta)
+            if "loss" in losses:
+                losses["loss"] += policy_loss
+            else:
+                losses["loss"] = policy_loss
+            losses["policy_loss"] = policy_loss
+            
+        return losses
     
     def evaluate(self, **kwargs):
         return self.glamm_model.evaluate(**kwargs)

@@ -9,22 +9,27 @@ from transformers import AutoTokenizer, CLIPImageProcessor
 
 from eval.utils import *
 from eval.ddp import *
-from model.GLaMM import GLaMMForCausalLM
+from model.GLaMM import GLaMMForCausalLM, GLaMMWithPolicy
 from model.llava import conversation as conversation_lib
 from model.llava.mm_utils import tokenizer_image_token
 from model.SAM.utils.transforms import ResizeLongestSide
 from tools.utils import DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
 from spacy_utils import extract_direct_object_phrases
+from config import config_factory
+from train import setup_tokenizer_and_special_tokens, initialize_model
+import tools.file_utils as FileUtils
+import tools.obs_utils as ObsUtils
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="GLaMM Inference - GCG")
 
-    parser.add_argument("--hf_model_path", required=True, help="The model path in huggingface format.")
+    parser.add_argument("--version", required=True, help="The model path in huggingface format.")
     parser.add_argument("--img_dir", required=False, default="./data/GranDf/GranDf_HA_images/val_test",
                         help="The directory containing images to run inference.")
     parser.add_argument("--output_dir", required=True, help="The directory to store the response in json format.")
     parser.add_argument("--anno_path", required=True, help="The val annotation file path")
+    parser.add_argument("--policy_config", default=None, type=str)
 
     parser.add_argument("--image_size", default=1024, type=int, help="image size")
     parser.add_argument("--model_max_length", default=512, type=int)
@@ -77,7 +82,16 @@ def inference(instructions, image_path):
     bboxes = None  # No box/region is input in GCG task
 
     # Generate output
-    output_ids, pred_masks = model.evaluate(image_clip, image, input_ids, resize_list, original_size_list, max_tokens_new=512, bboxes=bboxes, device=input_ids.device)
+    output_ids, pred_masks = model.evaluate(
+        global_enc_images=image_clip, 
+        grounding_enc_images=image, 
+        input_ids=input_ids, 
+        resize_list=resize_list, 
+        orig_sizes=original_size_list, 
+        max_tokens_new=512, 
+        bboxes=bboxes, 
+        device=input_ids.device
+    )
     output_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
 
     # Post-processing
@@ -110,35 +124,81 @@ def custom_collate_fn(batch):
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.policy_config is not None:
+        ext_cfg = json.load(open(args.policy_config, 'r'))
+        policy_config = config_factory(ext_cfg["algo_name"])
+        with policy_config.unlocked():
+            policy_config.update(ext_cfg)
+    else:
+        policy_config = None
+    
     init_distributed_mode(args)
 
     # Initialize tokenizer and model
-    tokenizer = AutoTokenizer.from_pretrained(args.hf_model_path, cache_dir=None,
+    tokenizer = AutoTokenizer.from_pretrained(args.version, cache_dir=None,
                                               model_max_length=args.model_max_length, padding_side="right",
                                               use_fast=False)
     tokenizer.pad_token = tokenizer.unk_token
     seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
     torch_dtype = torch.bfloat16  # By default, using bf16
-    kwargs = {"torch_dtype": torch_dtype}
-    model = GLaMMForCausalLM.from_pretrained(args.hf_model_path, low_cpu_mem_usage=True,
-                                             seg_token_idx=seg_token_idx, **kwargs)
-    # Update model config
-    model.config.eos_token_id = tokenizer.eos_token_id
-    model.config.bos_token_id = tokenizer.bos_token_id
-    model.config.pad_token_id = tokenizer.pad_token_id
+    kwargs = {
+        # "torch_dtype": torch_dtype,
+        "seg_token_idx": seg_token_idx
+    }
+    
+    # tokenizer = setup_tokenizer_and_special_tokens(args)
+    
+    # model = initialize_model
+    
+    if policy_config is None:
+        model = GLaMMForCausalLM.from_pretrained(args.version, low_cpu_mem_usage=True, **kwargs)
+        # Update model config
+        model.config.eos_token_id = tokenizer.eos_token_id
+        model.config.bos_token_id = tokenizer.bos_token_id
+        model.config.pad_token_id = tokenizer.pad_token_id
+    else:
+        # breakpoint()
+        ObsUtils.initialize_obs_utils_with_config(policy_config)
+        shape_meta = FileUtils.get_shape_metadata_from_dataset(
+            dataset_path=policy_config.train.data[0]["path"],
+            action_keys=policy_config.train.action_keys,
+            all_obs_keys=policy_config.all_obs_keys,
+            ds_format=policy_config.train.data_format,
+            verbose=False
+        )
+        
+        model = GLaMMWithPolicy.from_pretrained(
+            args.version, 
+            glamm_version=None,
+            glamm_model_args=kwargs,
+            obs_key_shapes=shape_meta["all_shapes"],
+            ac_dim=shape_meta["ac_dim"],
+            policy_config=policy_config,
+            low_cpu_mem_usage=False,
+            _fast_init=False
+        )
+        model.glamm_model.seg_token_idx = seg_token_idx
+        model.glamm_model.config.eos_token_id = tokenizer.eos_token_id
+        model.glamm_model.config.bos_token_id = tokenizer.bos_token_id
+        model.glamm_model.config.pad_token_id = tokenizer.pad_token_id
 
+    if policy_config:
+        glamm_model = model.glamm_model
+    else:
+        glamm_model = model
+    
     # Initialize Global Image Encoder (CLIP)
-    model.get_model().initialize_vision_modules(model.get_model().config)
-    vision_tower = model.get_model().get_vision_tower()
+    glamm_model.get_model().initialize_vision_modules(glamm_model.get_model().config)
+    vision_tower = glamm_model.get_model().get_vision_tower()
     vision_tower.to(dtype=torch_dtype)
 
     # Transfer the model to GPU
     model = model.bfloat16().cuda()  # Replace with model = model.float().cuda() for 32 bit inference
-    vision_tower = model.get_model().get_vision_tower()
+    vision_tower = glamm_model.get_model().get_vision_tower()
     vision_tower.to(device="cuda")
 
     # Initialize Image Processor for GLobal Image Encoder (CLIP)
-    clip_image_processor = CLIPImageProcessor.from_pretrained(model.config.vision_tower)
+    clip_image_processor = CLIPImageProcessor.from_pretrained(glamm_model.config.vision_tower)
     transform = ResizeLongestSide(args.image_size)
 
     model.eval()  # Model should be in evaluation mode for inference

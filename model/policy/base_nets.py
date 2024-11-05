@@ -615,11 +615,13 @@ class ResNet18ConvFiLM(ConvBase):
         self._conv_blocks = nn.ModuleList(conv_blocks)
 
         film_layers = []
-        current_channels = self._base_block(torch.rand((1, input_channel, 3, 3))).shape[1]
+        
+        with torch.no_grad():
+            current_channels = self._base_block(torch.rand((1, input_channel, 3, 3))).shape[1]
         for conv in conv_blocks:
             current_channels = conv(torch.rand((1, current_channels, 3, 3))).shape[1]
             film_layers.append(FiLMLayer(lang_emb_dim, current_channels))
-
+        
         self._film_layers = nn.ModuleList(film_layers)
         self._output_channels = current_channels
 

@@ -32,6 +32,10 @@ class GroundedVLADataset(GCGBaseDataset):
         self,
         hdf5_path,
         raw_data_dir,
+        obs_keys,
+        action_keys,
+        dataset_keys,
+        action_config,
         frame_stack=10,
         seq_length=10,
         pad_frame_stack=True,
@@ -48,12 +52,12 @@ class GroundedVLADataset(GCGBaseDataset):
         if not os.path.exists(self.image_folder):
             os.mkdir(self.image_folder)
         
-        self.obs_keys = tuple(["robot0_base_to_eef_pos", "robot0_base_to_eef_quat", "robot0_base_pos", "robot0_base_quat", "robot0_gripper_qpos", "robot0_agentview_left_image"]) # , "robot0_agentview_right_image", "robot0_eye_in_hand_image"
-        self.action_keys = tuple(["actions"])
-        self.dataset_keys = tuple(["actions"])
+        self.obs_keys = obs_keys
+        self.action_keys = tuple(action_keys)
+        self.dataset_keys = tuple(dataset_keys)
         self.camera_names = tuple(["robot0_agentview_left", "robot0_agentview_right", "robot0_eye_in_hand"])
         
-        self.action_config = {'actions': {'normalization': None}, 'action_dict/abs_pos': {'normalization': 'min_max'}, 'action_dict/abs_rot_axis_angle': {'normalization': 'min_max', 'format': 'rot_axis_angle'}, 'action_dict/abs_rot_6d': {'normalization': None, 'format': 'rot_6d'}, 'action_dict/rel_pos': {'normalization': None}, 'action_dict/rel_rot_axis_angle': {'normalization': None, 'format': 'rot_axis_angle'}, 'action_dict/rel_rot_6d': {'normalization': None, 'format': 'rot_6d'}, 'action_dict/gripper': {'normalization': None}, 'action_dict/base_mode': {'normalization': None}}
+        self.action_config = action_config
 
         self.n_frame_stack = frame_stack
         assert self.n_frame_stack >= 1
@@ -103,7 +107,7 @@ class GroundedVLADataset(GCGBaseDataset):
 
         # sort demo keys
         inds = np.argsort([int(elem[5:]) for elem in self.demos])
-        inds = inds[:-len(inds)//10]  # leave 1/10 for validation
+        inds = inds[:-len(inds)//20]  # leave 1/20 for validation
         self.demos = [self.demos[i] for i in inds]
 
         self.n_demos = len(self.demos)
@@ -329,14 +333,15 @@ class GroundedVLADataset(GCGBaseDataset):
         mask_key = f"{cam_name}_mask"
         image_data = self.get_dataset_for_ep(demo_id, f"obs/{image_key}")
         mask_data = self.get_dataset_for_ep(demo_id, f"obs/{mask_key}")
-        image_path = os.path.join(self.image_folder, f"{self.dataset_name}_{demo_id}_{image_key}.jpg")
-        if not os.path.exists(image_path):
-            image = Image.fromarray(image_data[0])
-            image.save(image_path)
+        # image_path = os.path.join(self.image_folder, f"{self.dataset_name}_{demo_id}_{image_key}.jpg")
+        # if not os.path.exists(image_path):
+        #     image = Image.fromarray(image_data[0])
+        #     image.save(image_path)
+            
         
         lang = self._demo_id_to_demo_lang_str[demo_id]
         target_obj_phrase = "the " + self._demo_id_to_demo_target_obj_phrase[demo_id]  # check if the phrase starts with "the "
-        target_place_phrase = "the " + self._demo_id_to_demo_target_place_phrase[demo_id]
+        target_place_phrase = "the " + self._demo_id_to_demo_target_place_phrase[demo_id] if self._demo_id_to_demo_target_place_phrase[demo_id] is not None else None
         
         caption = f"The target object is {target_obj_phrase}."
         data_labels = [target_obj_phrase]
@@ -354,8 +359,9 @@ class GroundedVLADataset(GCGBaseDataset):
         
         prompt = GVLA_PROMPT_TEMPLATE.format(lang)
         
-        image = cv2.imread(image_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = image_data[0]
+        # image = cv2.imread(image_path)
+        # image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         global_enc_image = self.global_enc_processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
         image = self.transform.apply_image(image)
         image_resize = image.shape[:2]
@@ -366,7 +372,7 @@ class GroundedVLADataset(GCGBaseDataset):
         masks = torch.from_numpy(masks)
         label = torch.ones(masks.shape[1:], dtype=torch.long) * self.IGNORE_LABEL
         
-        return (image_path, global_enc_image, grounding_enc_image, bboxes, conversations, masks, label, image_resize, questions, data_labels)
+        return ("", global_enc_image, grounding_enc_image, bboxes, conversations, masks, label, image_resize, questions, data_labels)
         
 
     def get_sequence_from_demo(self, demo_id, index_in_demo, keys, num_frames_to_stack=0, seq_length=1):
@@ -404,19 +410,42 @@ class GroundedVLADataset(GCGBaseDataset):
             assert seq_end_pad == 0
 
         # fetch observation from the dataset file
-        # masked_keys = [
-        #     "obs/robot0_agentview_left_mask",
-        #     "obs/robot0_agentview_right_mask",
-        #     "obs/robot0_eye_in_hand_mask"
-        # ]
+        masked_keys = [
+            "obs/robot0_agentview_left_mask",
+            "obs/robot0_agentview_right_mask",
+            "obs/robot0_eye_in_hand_mask"
+        ]
+        depth_keys = [
+            "obs/robot0_agentview_left_depth",
+            "obs/robot0_agentview_right_depth",
+            "obs/robot0_eye_in_hand_depth"
+        ]
         seq = dict()
         for k in keys:
             data = self.get_dataset_for_ep(demo_id, k)
-            # if k in masked_keys:
-            #     # seq[k] = data[:1].repeat(seq_end_index-seq_begin_index+1, axis=0)
-            #     seq[k] = data[:1]
-            # else:
-            seq[k] = data[seq_begin_index: seq_end_index]
+            if k in masked_keys:
+                seq[k] = data[:1].repeat(seq_end_index-seq_begin_index, axis=0)
+            else:
+                seq[k] = data[seq_begin_index: seq_end_index]
+        
+        if ObsUtils.MASK_CHANNEL == 1:
+            for k in masked_keys:
+                image_key = k.replace('_mask', '_image')
+                if image_key not in keys:
+                    continue
+                data = self.get_dataset_for_ep(demo_id, k)
+                mask_data = data[:1].repeat(seq_end_index-seq_begin_index, axis=0) * 127
+                seq[image_key] = np.concatenate([seq[image_key], mask_data], axis=-1)
+        
+        if ObsUtils.DEPTH_CHANNEL == 1:
+            for k in depth_keys:
+                image_key = k.replace('_depth', '_image')
+                if image_key not in keys:
+                    continue
+                data = self.get_dataset_for_ep(demo_id, k)
+                depth_data = data[seq_begin_index: seq_end_index] * 255
+                depth_data = depth_data.astype(np.uint8)
+                seq[image_key] = np.concatenate([seq[image_key], depth_data], axis=-1)
 
         seq = TensorUtils.pad_sequence(seq, padding=(seq_begin_pad, seq_end_pad), pad_same=True)
         pad_mask = np.array([0] * seq_begin_pad + [1] * (seq_end_index - seq_begin_index) + [0] * seq_end_pad)

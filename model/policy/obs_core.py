@@ -292,7 +292,7 @@ class VisualCoreLanguageConditioned(EncoderCore, BaseNets.ConvBase):
         Forward pass through visual core.
         """
         ndim = len(self.input_shape)
-        assert tuple(inputs.shape)[-ndim:] == tuple(self.input_shape)
+        assert tuple(inputs.shape)[-ndim:] == tuple(self.input_shape), breakpoint()
         x = self.backbone(inputs, lang_emb)
         return super(VisualCoreLanguageConditioned, self).forward(x)
 

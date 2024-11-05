@@ -25,7 +25,7 @@ class GCGBaseDataset(torch.utils.data.Dataset):
     IMG_SIZE = 1024
     IGNORE_LABEL = 255
 
-    def __init__(self, dataset_dir, tokenizer, global_image_encoder, epoch_samples=8000, precision="fp32",
+    def __init__(self, dataset_dir=None, tokenizer=None, global_image_encoder=None, epoch_samples=8000, precision="fp32",
                  image_size=224, num_classes_per_sample=3, validation=False, random_sampling=True,
                  image_dir='', json_path='', **kwargs):
         self.epoch_samples = epoch_samples
@@ -35,7 +35,7 @@ class GCGBaseDataset(torch.utils.data.Dataset):
         self.tokenizer = tokenizer
         self.precision = precision
         self.transform = ResizeLongestSide(image_size)
-        self.global_enc_processor = CLIPImageProcessor.from_pretrained(global_image_encoder)
+        self.global_enc_processor = CLIPImageProcessor.from_pretrained(global_image_encoder) if global_image_encoder is not None else None
         self.validation = validation
         self.random_sampling = random_sampling
 
@@ -44,8 +44,8 @@ class GCGBaseDataset(torch.utils.data.Dataset):
         self.validation = validation
 
         # Defining paths
-        self.base_dir = os.path.join(dataset_dir, "GranDf")
         if json_path and image_dir:
+            self.base_dir = os.path.join(dataset_dir, "GranDf")
             self.image_folder = os.path.join(image_dir)
             self.ann_file = os.path.join(self.base_dir, "annotations", "train", json_path)
             self.data_infos = self._load_annotations(self.ann_file)
@@ -54,7 +54,10 @@ class GCGBaseDataset(torch.utils.data.Dataset):
     def _load_annotations(self, ann_file):
         with open(ann_file, 'r') as f:
             data_infos = json.load(f)
-        data_infos = data_infos[0: 1000] if self.validation else data_infos
+        
+        if self.validation:
+            random.seed(317)
+            data_infos = random.sample(data_infos, 1000)
         return data_infos
 
     def _parse_annotations(self, ann_info):
@@ -193,7 +196,7 @@ class RobocasaGCGDataset(GCGBaseDataset):
         json_files = {'validation': 'robocasa_GCG_val.json', 'training': 'robocasa_GCG_train.json'}
         json_path = json_files['validation'] if validation else json_files['training']
         # image_dir = os.path.join(self.base_dir, "robocasa_images")
-        image_dir = "data/robocasa_datasets/v0.1/generated_1013/images"
+        image_dir = "data/robocasa_datasets/v0.1/generated_1024/images"
         mode = "Val" if validation else "Train"
         
         super().__init__(

@@ -46,8 +46,12 @@ def evaluate_mask_miou(image_ids, pred_masks, gt_masks, save_mask_dir):
         tmp_gt_masks = [maskUtils.decode(x) for x in gt_masks[image_id]]
         tmp_pred_masks = [maskUtils.decode(x) for x in pred_masks[image_id]]
         
-        save_gt_mask = tmp_gt_masks[0] * 255
-        save_pred_mask = tmp_pred_masks[0] * 255
+        save_gt_mask = tmp_gt_masks[0] * 127
+        if len(tmp_gt_massk) > 1:
+            save_gt_mask += tmp_gt_masks[1] * 255
+        save_pred_mask = tmp_pred_masks[0] * 127
+        if len(tmp_pred_masks) > 1:
+            save_pred_mask += tmp_pred_masks[1] * 255
         save_gt_mask = Image.fromarray(save_gt_mask)
         save_pred_mask = Image.fromarray(save_pred_mask)
         save_gt_mask.save(os.path.join(save_mask_dir, f"{image_id}_gt.jpg"))

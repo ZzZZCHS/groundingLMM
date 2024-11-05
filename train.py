@@ -16,6 +16,7 @@ import numpy as np
 import transformers
 import glob
 import json
+import imageio
 from functools import partial
 from torch.utils.data import ConcatDataset
 from peft import LoraConfig, get_peft_model
@@ -35,7 +36,21 @@ from dataset.gvla_datasets.grounded_vla_ds import GroundedVLADataset, GroundedVL
 from config import config_factory
 import tools.file_utils as FileUtils
 import tools.obs_utils as ObsUtils
+import tools.log_utils as LogUtils
+import tools.tensor_utils as TensorUtils
+import tools.env_utils as EnvUtils
+import tools.lang_utils as LangUtils
+from tools.script_utils import deep_update
+from tools.train_utils import VAL_ENV_INFOS
+from transformers import LlamaConfig
+import traceback
+import robomimic.utils.obs_utils as RobomimicObsUtils
+RobomimicObsUtils.RESIZE_TO_128 = False
+from copy import deepcopy
+import cv2
 
+
+eval_env_meta_list, eval_env_name_list, eval_env_horizon_list = [], [], []
 
 def parse_args(args):
     parser = argparse.ArgumentParser(description="GLaMM Model Training")
@@ -57,6 +72,8 @@ def parse_args(args):
     parser.add_argument("--pretrain_mm_mlp_adapter", default="", type=str)
     parser.add_argument("--precision", default='bf16', type=str)
     parser.add_argument("--policy_config", default=None, type=str)
+    parser.add_argument("--only_policy", action="store_true")
+    parser.add_argument("--use_gt_mask", action="store_true")
 
     # Dataset settings
     parser.add_argument("--use_cap_data", action="store_true", help="Use caption data")
@@ -90,6 +107,8 @@ def parse_args(args):
     parser.add_argument("--auto_resume", action="store_true")
     parser.add_argument("--weight", default="", type=str)
     parser.add_argument("--lr", default=0.0003, type=float)
+    parser.add_argument("--weight_decay", default=0., type=float)
+    parser.add_argument("--warmup_steps", default=100, type=int)
     parser.add_argument("--epochs", default=10, type=int)
     parser.add_argument("--steps_per_epoch", default=500, type=int)
     parser.add_argument("--batch_size", default=2, type=int, help="batch size per device per step")
@@ -107,7 +126,7 @@ def parse_args(args):
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
     parser.add_argument("--train_mask_decoder", action="store_true", default=True)
     parser.add_argument("--use_mm_start_end", action="store_true", default=True)
-    parser.add_argument("--print_freq", default=1, type=int)
+    parser.add_argument("--print_freq", default=10, type=int)
     parser.add_argument("--start_epoch", default=0, type=int)
     parser.add_argument("--local_rank", default=0, type=int, help="node rank")
 
@@ -125,6 +144,44 @@ def parse_args(args):
     parser.add_argument("--debug", action="store_true")
 
     return parser.parse_args(args)
+
+
+def prepare_observation(ob, ep_lang_emb, model):
+    if len(ob["robot0_eef_pos"].shape) == 1:
+        ob["lang_emb"] = ep_lang_emb
+    else:
+        ob["lang_emb"] = np.repeat(ep_lang_emb[np.newaxis], len(ob["robot0_eef_pos"]), axis=0)
+    ob = TensorUtils.to_tensor(ob)
+    ob = TensorUtils.to_batch(ob)
+    ob = TensorUtils.to_device(ob, model.policy_net.device)
+    ob = TensorUtils.to_float(ob)
+    return ob
+
+
+def postprocess_action(ac):
+    ac = ac[0]
+    ac = TensorUtils.to_numpy(ac)
+    ori_ac = ac
+    # if action_normalization_stats is not None:
+    #     action_keys = model.policy_net.global_config.train.action_keys
+    #     action_shapes = {k: action_normalization_stats[k]["offset"].shape[1:] for k in action_normalization_stats}
+    #     ac_dict = AcUtils.vector_to_action_dict(ac, action_shapes=action_shapes, action_keys=action_keys)
+    #     ac_dict = ObsUtils.unnormalize_dict(ac_dict, normalization_stats=action_normalization_stats)
+    #     action_config = model.policy_net.global_config.train.action_config
+    #     for key, value in ac_dict.items():
+    #         this_format = action_config[key].get("format", None)
+    #         if this_format == "rot_6d":
+    #             rot_6d = torch.from_numpy(value).unsqueeze(0)
+    #             conversion_format = action_config[key].get("convert_at_runtime", "rot_axis_angle")
+    #             if conversion_format == "rot_axis_angle":
+    #                 rot = TorchUtils.rot_6d_to_axis_angle(rot_6d=rot_6d).squeeze().numpy()
+    #             elif conversion_format == "rot_euler":
+    #                 rot = TorchUtils.rot_6d_to_euler_angles(rot_6d=rot_6d, convention="XYZ").squeeze().numpy()
+    #             else:
+    #                 raise ValueError
+    #             ac_dict[key] = rot
+    #     ac = AcUtils.action_dict_to_vector(ac_dict, action_keys=action_keys)
+    return ac
 
 
 def initialize_environment(args):
@@ -174,7 +231,7 @@ def initialize_model(args, tokenizer, policy_config):
                    "pretrain_mm_mlp_adapter", "tune_mm_mlp_adapter", "freeze_mm_mlp_adapter", "mm_use_im_start_end",
                    "with_region", "bbox_token_idx", "eop_token_idx", "bop_token_idx"]}
     model_args["num_level_reg_features"] = 4
-
+    shape_meta = None
     if policy_config is None:
         model = GLaMMForCausalLM.from_pretrained(
             args.version, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, **model_args
@@ -186,6 +243,7 @@ def initialize_model(args, tokenizer, policy_config):
         model.config.pad_token_id = tokenizer.pad_token_id
     else:
         ObsUtils.initialize_obs_utils_with_config(policy_config)
+        RobomimicObsUtils.initialize_obs_utils_with_config(policy_config)
         shape_meta = FileUtils.get_shape_metadata_from_dataset(
             dataset_path=policy_config.train.data[0]["path"],
             action_keys=policy_config.train.action_keys,
@@ -194,22 +252,31 @@ def initialize_model(args, tokenizer, policy_config):
             verbose=False
         )
         model = GLaMMWithPolicy(
+            config=LlamaConfig(),
             glamm_version=args.version, 
             glamm_model_args=model_args, 
             obs_key_shapes=shape_meta["all_shapes"],
             ac_dim=shape_meta["ac_dim"],
-            policy_config=policy_config
+            policy_config=policy_config,
+            only_policy=args.only_policy
         )
         # Configure model tokens
-        model.glamm_model.config.eos_token_id = tokenizer.eos_token_id
-        model.glamm_model.config.bos_token_id = tokenizer.bos_token_id
-        model.glamm_model.config.pad_token_id = tokenizer.pad_token_id
-    print('\033[92m' + "---- Initialized model from: {} ----".format(args.version) + '\033[0m')
-
-    return model
+        if not args.only_policy:
+            model.glamm_model.config.eos_token_id = tokenizer.eos_token_id
+            model.glamm_model.config.bos_token_id = tokenizer.bos_token_id
+            model.glamm_model.config.pad_token_id = tokenizer.pad_token_id
+    return model, shape_meta
 
 
 def prepare_model_for_training(model, tokenizer, args, policy_config):
+    
+    # Configure conversation library
+    conversation_lib.default_conversation = conversation_lib.conv_templates[args.conv_type]
+    
+    if args.only_policy:
+        set_trainable_modules(model)
+        return
+    
     # Enable input gradients
     if policy_config:
         glamm_model = model.glamm_model
@@ -258,9 +325,6 @@ def prepare_model_for_training(model, tokenizer, args, policy_config):
             p.requires_grad = True
         for p in glamm_model.get_model().mm_projector.parameters():
             p.requires_grad = True
-
-    # Configure conversation library
-    conversation_lib.default_conversation = conversation_lib.conv_templates[args.conv_type]
 
     # Configure LoRA if applicable
     if lora_r > 0:
@@ -323,7 +387,7 @@ def set_trainable_modules(model):
     count_parameters(model)
 
 
-def initialize_datasets_and_loaders(args, tokenizer):
+def initialize_datasets_and_loaders(args, tokenizer, policy_config, shape_meta=None):
     world_size = torch.cuda.device_count()
     args.distributed = world_size > 1
 
@@ -349,7 +413,9 @@ def initialize_datasets_and_loaders(args, tokenizer):
     if args.use_gvla_data:
         gvla_datasets = []
         for hdf5_path in glob.glob(os.path.join(args.raw_data_dir, "*.hdf5")):
-            gvla_dataset = GroundedVLADataset(**common_ds_args, hdf5_path=hdf5_path, raw_data_dir=args.raw_data_dir)
+            if "PnPCounterToCab" not in hdf5_path:
+                continue
+            gvla_dataset = GroundedVLADataset(**common_ds_args, hdf5_path=hdf5_path, raw_data_dir=args.raw_data_dir, obs_keys=shape_meta["all_obs_keys"], action_keys=policy_config.train.action_keys, dataset_keys=policy_config.train.dataset_keys, action_config=policy_config.train.action_config)
             gvla_datasets.append(gvla_dataset)
             if args.debug:
                 break
@@ -444,18 +510,49 @@ def setup_data_loaders(args, cap_train_dataset, reg_train_dataset, seg_train_dat
 
 
 def initialize_deepspeed(model, tokenizer, args):
-    ds_config = {"train_micro_batch_size_per_gpu": args.batch_size,
-                 "gradient_accumulation_steps": args.grad_accumulation_steps,
-                 "optimizer": {"type": "AdamW", "params": {"lr": args.lr, "weight_decay": 0.0,
-                                                           "betas": (args.beta1, args.beta2)}},
-                 "scheduler": {"type": "WarmupDecayLR",
-                               "params": {"total_num_steps": args.epochs * args.steps_per_epoch, "warmup_min_lr": 0,
-                                          "warmup_max_lr": args.lr, "warmup_num_steps": 100, "warmup_type": "linear"}},
-                 "fp16": {"enabled": args.precision == "fp16"}, "bf16": {"enabled": args.precision == "bf16"},
-                 "gradient_clipping": 1.0,
-                 "zero_optimization": {"stage": 2, "contiguous_gradients": True, "overlap_comm": True,
-                                       "reduce_scatter": True, "reduce_bucket_size": 5e8,
-                                       "allgather_bucket_size": 5e8}, }
+    ds_config = {
+        "train_micro_batch_size_per_gpu": args.batch_size,
+        "gradient_accumulation_steps": args.grad_accumulation_steps,
+        "optimizer": {
+            "type": "AdamW", 
+            "params": {
+                "lr": args.lr, 
+                "weight_decay": args.weight_decay,
+                "betas": (args.beta1, args.beta2)
+            }
+        },
+        "scheduler": {
+            # "type": "WarmupLR",
+            # "params": {
+            #     "warmup_num_steps": args.warmup_steps, 
+            #     "warmup_type": "log",
+            #     "warmup_max_lr": args.lr
+            # }
+            "type": "WarmupDecayLR",
+            "params": {
+                "total_num_steps": args.epochs * args.steps_per_epoch,
+                "warmup_min_lr": 0,
+                "warmup_max_lr": args.lr,
+                "warmup_num_steps": args.warmup_steps,
+                "warmup_type": "linear"
+            }
+        },
+        "fp16": {
+            "enabled": args.precision == "fp16"
+        }, 
+        "bf16": {
+            "enabled": args.precision == "bf16"
+        },
+        "gradient_clipping": 1.0,
+        "zero_optimization": {
+            "stage": 2, 
+            "contiguous_gradients": True, 
+            "overlap_comm": True,
+            "reduce_scatter": True, 
+            "reduce_bucket_size": 5e8,
+            "allgather_bucket_size": 5e8
+        }, 
+    }
 
     model_engine, optimizer, _, scheduler = deepspeed.initialize(
         model=model, model_parameters=model.parameters(), collate_fn=partial(
@@ -478,26 +575,273 @@ def resume_training_from_checkpoint(model_engine, args):
             ckpt_dir = f.readlines()[0].strip()
         args.start_epoch = int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
         print(f"Resume training from {args.resume}, start from epoch {args.start_epoch}")
+        
+
+def run_rollout(
+        env, 
+        horizon,
+        initial_state=None,
+        model=None,
+        lang_encoder=None,
+        render=False,
+        video_writer=None,
+        video_skip=5,
+        ep_i=0,
+        args=None
+    ):
+    
+    env.env.env.add_object_num = 0
+    ob_dict = env.reset_to(initial_state)
+    assert env.env.env.unique_attr == json.loads(initial_state["ep_meta"])["unique_attr"]
+    
+    # policy start episode
+    ep_lang_emb = TensorUtils.to_numpy(lang_encoder.get_lang_emb(env._ep_lang_str))
+    model.policy_net.set_eval()
+    model.policy_net.reset()
+    
+
+    results = {}
+    video_count = 0  # video frame counter
+
+    rews = []
+    success = None #{ k: False for k in env.is_success() } # success metrics
+
+    end_step = None
+
+    video_frames = []
+    
+    camera_names = ["robot0_agentview_left", "robot0_agentview_right", "robot0_eye_in_hand"]
+        
+    masked_dict = {}
+    if args.use_gt_mask:
+        target_obj_str = env.env.env.target_obj_str
+        if target_obj_str == "obj":
+            target_obj_str += "_main"
+        target_place_str = env.env.env.target_place_str
+        masked_dict = {}
+        geom2body_id_mapping = {geom_id: body_id for geom_id, body_id in enumerate(env.env.env.sim.model.geom_bodyid)}
+        name2id = env.env.env.sim.model._body_name2id
+        for cam_name in camera_names:
+            seg = env.env.env.sim.render(
+                camera_name=cam_name,
+                width=256,
+                height=256,
+                depth=False,
+                segmentation=True
+            )
+            seg = seg[::-1, :, 1]
+            tmp_seg = (
+                np.fromiter(
+                    map(
+                        lambda x: geom2body_id_mapping.get(x, -1),
+                        seg.flatten()
+                    ),
+                    dtype=np.int32
+                ).reshape(256, 256)
+            )
+            tmp_mask = np.zeros(tmp_seg.shape, dtype=np.uint8)
+            for tmp_target_obj_str in target_obj_str.split('/'):
+                tmp_mask[tmp_seg == name2id[tmp_target_obj_str]] = 1
+            if target_place_str:
+                tmp_mask[tmp_seg == name2id[target_place_str]] = 2
+                if (tmp_seg == name2id[target_place_str]).sum() == 0 and target_place_str == "container_main" and name2id[target_place_str] == name2id[None] - 1:
+                    tmp_mask[tmp_seg == name2id[None]] = 2
+            tmp_mask = tmp_mask.astype(np.float32) / 2.
+            tmp_mask = np.expand_dims(tmp_mask, axis=0)
+            tmp_mask = np.expand_dims(tmp_mask, axis=0).repeat(ob_dict[f"{cam_name}_image"].shape[0], axis=0)
+            masked_dict[f"{cam_name}_mask"] = tmp_mask
+    # else:
+
+    obs_keys = ["robot0_agentview_left_image"]
+    # , "robot0_agentview_right_image", "robot0_eye_in_hand_image"]
+    pred_embeddings = None
+    if not args.only_policy:
+        for obs_key in obs_keys:
+            tmp_img = ob_dict[obs_key][0]
+            tmp_img = np.uint8(tmp_img*255).transpose(1, 2, 0)
+            
+            cleaned_str, pred_masks, phrases, pred_embeddings = inference(env._ep_lang_str, tmp_img)
+            print(cleaned_str, phrases)
+            
+            pred_embeddings = pred_embeddings[0]
+        
+            if pred_embeddings.shape[0] == 1:
+                pred_embeddings = pred_embeddings.repeat(2, 1)
+            tmp_norm = pred_embeddings.unsqueeze(0).repeat(2, 1, 1).norm()
+            pred_embeddings = pred_embeddings / tmp_norm
+            pred_embeddings = pred_embeddings.flatten(0, 1)
+            seq_len = ob_dict[obs_key].shape[0]
+            pred_embeddings = pred_embeddings.unsqueeze(0).repeat(seq_len, 1)
+            pred_embeddings = pred_embeddings.unsqueeze(0)
+    for step_i in range(horizon): #LogUtils.tqdm(range(horizon)):
+        # for cam_name in camera_names:
+        #     depth_name = f"{cam_name}_depth"
+        #     _, depth = env.env.env.sim.render(
+        #         camera_name=cam_name,
+        #         width=256,
+        #         height=256,
+        #         depth=True
+        #     )
+        #     depth = np.expand_dims(depth[::-1], axis=0)
+        #     if depth_name not in env.obs_history:
+        #         env.obs_history[depth_name] = deque(
+        #             [depth[None]] * env.num_frames,
+        #             maxlen=env.num_frames
+        #         )
+        #     else:
+        #         env.obs_history[depth_name].append(depth[None])
+        #     ob_dict = env._get_stacked_obs_from_history()
+        
+        ob_dict.update(masked_dict)
+        
+        if ObsUtils.MASK_CHANNEL == 1:
+            for cam_name in camera_names:
+                image_key = f"{cam_name}_image"
+                mask_key = f"{cam_name}_mask"
+                # ob_dict[image_key] = np.concatenate([ob_dict[image_key], ob_dict[mask_key]], axis=1)
+                ob_dict[image_key][:, 3:4, ...] = ob_dict[mask_key]
+                del ob_dict[mask_key]
+        if ObsUtils.DEPTH_CHANNEL == 1:
+            for cam_name in camera_names:
+                image_key = f"{cam_name}_image"
+                depth_key = f"{cam_name}_depth"
+                # ob_dict[image_key] = np.concatenate([ob_dict[image_key], ob_dict[depth_key]], axis=1)
+                ob_dict[image_key][:, -1:, ...] = ob_dict[depth_key]
+                del ob_dict[depth_key]
+            
+        ob_input = prepare_observation(ob_dict, ep_lang_emb, model)
+        ac = model.policy_net.get_action(obs_dict=ob_input, mask_embeds=pred_embeddings)
+        
+        ac = postprocess_action(ac)
+
+        # play action
+        ob_dict, r, done, info = env.step(ac)
+
+        # compute reward
+        rews.append(r)
+
+        cur_success_metrics = info["is_success"]
+
+        if success is None:
+            success = deepcopy(cur_success_metrics)
+        else:
+            for k in success:
+                success[k] = success[k] | cur_success_metrics[k]
+
+        # visualization
+        if video_writer is not None:
+            if video_count % video_skip == 0:
+                frame = env.render(mode="rgb_array", height=512, width=512)
+                frame = frame.copy()
+                text1 = env._ep_lang_str
+                position1 = (10, 50)
+                color = (255, 0, 0)
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                thickness = 1
+                font_scale = 0.5
+                cv2.putText(frame, text1, position1, font, font_scale, color, thickness)
+                text2 = f"demo idx: {ep_i}"
+                position2 = (10, 100)
+                cv2.putText(frame, text2, position2, font, font_scale, color, thickness)
+                video_frames.append(frame)
+
+            video_count += 1
+
+        if done or success["task"]:
+            end_step = step_i
+            break
+
+
+    if video_writer is not None:
+        for frame in video_frames:
+            video_writer.append_data(frame)
+
+    end_step = end_step or step_i
+    total_reward = np.sum(rews[:end_step + 1])
+    
+    results["Return"] = total_reward
+    results["Horizon"] = end_step + 1
+    results["Success_Rate"] = float(success["task"])
+
+    # log additional success metrics
+    for k in success:
+        if k != "task":
+            if batched:
+                results["{}_Success_Rate".format(k)] = success[k].astype(float)
+            else:
+                results["{}_Success_Rate".format(k)] = float(success[k])
+
+    return results
+
+def eval_policy(args, epoch_i, policy_config, model, lang_encoder):
+    num_episodes = 20
+    envs = env_iterator(policy_config)
+    video_dir = os.path.join(args.log_dir, f"epoch{epoch_i}_videos")
+    os.makedirs(video_dir, exist_ok=True)
+    
+    success_rate_list = []
+    
+    for env, horizon in zip(envs, eval_env_horizon_list):
+        env_name = env.name
+        video_path = os.path.join(video_dir, f"{env_name}.mp4")
+        video_writer = imageio.get_writer(video_path, fps=20)
+        print("rollout: env={}, horizon={}, num_episodes={}".format(
+            env_name, horizon, num_episodes,
+        ))
+        num_success = 0
+        for ep_i in LogUtils.custom_tqdm(range(num_episodes), total=num_episodes):
+            initial_state = VAL_ENV_INFOS[env_name][ep_i]
+            try:
+                rollout_info = run_rollout(
+                    env=env,
+                    horizon=horizon,
+                    initial_state=initial_state,
+                    model=model,
+                    lang_encoder=lang_encoder,
+                    video_writer=video_writer,
+                    ep_i=ep_i,
+                    args=args
+                )
+            except Exception as e:
+                print(traceback.format_exc())
+                print(env_name, "Rollout exception at episode number {}!".format(ep_i))
+                # break
+                continue
+            print(f"{num_success} / {ep_i+1}")
+        video_writer.close()
+        del env
+        success_rate_list.append(num_success / num_episodes)
+    
+    return sum(success_rate_list) / len(success_rate_list) if len(success_rate_list) > 0 else 0.
 
 
 def main(args):
     if args.policy_config is not None:
         ext_cfg = json.load(open(args.policy_config, 'r'))
         policy_config = config_factory(ext_cfg["algo_name"])
-        with policy_config.values_unlocked():
+        with policy_config.unlocked():
             policy_config.update(ext_cfg)
     else:
         policy_config = None
     tokenizer = setup_tokenizer_and_special_tokens(args)
     
-    model = initialize_model(args, tokenizer, policy_config)
+    if policy_config:
+        load_eval_env_infos(args, policy_config)
+    model, shape_meta = initialize_model(args, tokenizer, policy_config)
     prepare_model_for_training(model, tokenizer, args, policy_config)
+    
+    if policy_config:
+        device="cuda:0"
+        lang_encoder = LangUtils.LangEncoder(
+            device=device,
+        )
+        model.policy_net.device = device
 
     model_engine, optimizer, scheduler = initialize_deepspeed(model, tokenizer, args)
     resume_training_from_checkpoint(model_engine, args)
 
     cap_train_dataset, reg_train_dataset, seg_train_dataset, gvla_train_dataset, val_datasets = (
-        initialize_datasets_and_loaders(args, tokenizer))
+        initialize_datasets_and_loaders(args, tokenizer, policy_config, shape_meta))
     cap_train_loader, reg_train_loader, seg_train_loader, gvla_train_loader, val_loader = (
         setup_data_loaders(args, cap_train_dataset, reg_train_dataset, seg_train_dataset, gvla_train_dataset, val_datasets, tokenizer))
 
@@ -516,7 +860,7 @@ def main(args):
         weights.append(args.weight_segm)
 
     # Assert that at least one dataset is active
-    assert active_dataloaders, "Error: At least one dataset (segm, reg, or cap) must be active."
+    # assert active_dataloaders, "Error: At least one dataset (segm, reg, or cap) must be active."
 
     dataset_iters = {'cap': iter(cap_train_loader) if args.use_cap_data else None,
                      'reg': iter(reg_train_loader) if args.use_reg_data else None,
@@ -536,27 +880,41 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         random.seed(epoch_seeds[epoch])
 
-        step_choices = random.choices(dataset_choices, weights=weights, k=args.steps_per_epoch)
+        if args.only_policy:
+            step_choices = None
+        else:
+            step_choices = random.choices(dataset_choices, weights=weights, k=args.steps_per_epoch)
 
-        dataset_iters, gvla_dataset_iter = train(
+        dataset_iters, gvla_dataset_iter, min_loss = train(
             active_dataloaders, model_engine, epoch, scheduler, writer, dataset_iters, gvla_dataset_iter, args, step_choices, gvla_train_loader
         )
 
-        if args.mask_validation:
-            giou, ciou = validate_model_performance(val_loader, model_engine, epoch, writer, args)
-            is_best = giou > best_giou
-            best_giou = max(giou, best_giou)
-            best_ciou = ciou if is_best else best_ciou
-            if args.local_rank == 0:  # Log the progress
-                print(f"Epoch: {epoch}, giou: {giou}, ciou: {ciou}, best_giou: {best_giou}, best_ciou: {best_ciou}")
-            save_checkpoint(model_engine, args, epoch, 'giou-ciou', f"{giou:.4f}-{ciou:.4f}", is_best)
+        if args.no_eval:
+            save_checkpoint(model_engine, args, epoch, 'loss', f"{min_loss:.4f}", True)
+        elif args.policy_config:
+            success_rate = -1.
+            if args.local_rank == 0:
+                success_rate = eval_policy(args, epoch, policy_config, model=model, lang_encoder=lang_encoder)
+                
+            torch.distributed.barrier()
+            # breakpoint()
+            save_checkpoint(model_engine, args, epoch, 'success', f"{min_loss:.4f}_{success_rate:.4f}", True)
         else:
-            cur_val_loss = validate_model_performance(val_loader, model_engine, epoch, writer, args)
-            is_best = cur_val_loss < best_val_loss
-            best_val_loss = min(cur_val_loss, best_val_loss)
-            if args.local_rank == 0:  # Log the progress
-                print(f"Epoch: {epoch}, Current Validation Loss: {cur_val_loss:.4f}, Best Validation Loss: {best_val_loss:}")
-            save_checkpoint(model_engine, args, epoch, 'loss', f"{cur_val_loss:.4f}", is_best)
+            if args.mask_validation:
+                giou, ciou = validate_model_performance(val_loader, model_engine, epoch, writer, args)
+                is_best = giou > best_giou
+                best_giou = max(giou, best_giou)
+                best_ciou = ciou if is_best else best_ciou
+                if args.local_rank == 0:  # Log the progress
+                    print(f"Epoch: {epoch}, giou: {giou}, ciou: {ciou}, best_giou: {best_giou}, best_ciou: {best_ciou}")
+                save_checkpoint(model_engine, args, epoch, 'giou-ciou', f"{giou:.4f}-{ciou:.4f}", is_best)
+            else:
+                cur_val_loss = validate_model_performance(val_loader, model_engine, epoch, writer, args)
+                is_best = cur_val_loss < best_val_loss
+                best_val_loss = min(cur_val_loss, best_val_loss)
+                if args.local_rank == 0:  # Log the progress
+                    print(f"Epoch: {epoch}, Current Validation Loss: {cur_val_loss:.4f}, Best Validation Loss: {best_val_loss:}")
+                save_checkpoint(model_engine, args, epoch, 'loss', f"{cur_val_loss:.4f}", is_best)
 
 
 def save_checkpoint(model_engine, args, epoch, metric_name, metric_value, is_best):
@@ -588,17 +946,18 @@ def train(active_datasets, model, epoch, scheduler, writer, dataset_iters, gvla_
 
     def log_progress():
         """Log training progress."""
+        global_global_step = epoch * args.steps_per_epoch + global_step
         if global_step % args.print_freq == 0:
             if args.distributed:
                 for tracker in trackers.values():
                     tracker.all_reduce()
 
             if args.local_rank == 0:
-                progress.display(global_step + 1)
+                progress.display(global_global_step + 1)
                 for key, tracker in trackers.items():
-                    writer.add_scalar(f"train/{key}", tracker.avg, global_step)
-                writer.add_scalar("metrics/total_secs_per_batch", batch_time.avg, global_step)
-                writer.add_scalar("metrics/data_secs_per_batch", data_time.avg, global_step)
+                    writer.add_scalar(f"train/{key}", tracker.avg, global_global_step)
+                writer.add_scalar("metrics/total_secs_per_batch", batch_time.avg, global_global_step)
+                writer.add_scalar("metrics/data_secs_per_batch", data_time.avg, global_global_step)
 
             for tracker in trackers.values():
                 tracker.reset()
@@ -615,10 +974,11 @@ def train(active_datasets, model, epoch, scheduler, writer, dataset_iters, gvla_
 
     model.train()
     end = time.time()
+    min_loss = 100
     for global_step in range(args.steps_per_epoch):
         for _ in range(args.grad_accumulation_steps):
             # Select data loader based on step choice
-            if args.use_gvla_data is not None and _ % 2 == 1:
+            if args.only_policy or args.use_gvla_data and _ % 2 == 1:
                 data_batch, new_iter = get_next_input(gvla_dataset_iter, gvla_train_loader)
                 gvla_dataset_iter = new_iter
             else:
@@ -635,13 +995,13 @@ def train(active_datasets, model, epoch, scheduler, writer, dataset_iters, gvla_
             # if "batch_meta" in data_batch:
             #     data_batch["batch_meta"] = dict_to_bfloat16(data_batch["batch_meta"])
 
-            output_dict = model(**data_batch)
+            output_dict = model(only_policy=args.only_policy, **data_batch)
 
             # Update training metrics
             for key, tracker in trackers.items():
                 if key in output_dict:
                     tracker.update(output_dict[key].item(), data_batch["global_enc_images"].size(0))
-
+            min_loss = min(min_loss, output_dict["loss"].item())
             model.backward(output_dict["loss"])
             model.step()
 
@@ -654,7 +1014,7 @@ def train(active_datasets, model, epoch, scheduler, writer, dataset_iters, gvla_
             if args.local_rank == 0:
                 writer.add_scalar("train/lr", curr_lr[0], global_step)
 
-    return dataset_iters, gvla_dataset_iter
+    return dataset_iters, gvla_dataset_iter, min_loss
 
 
 def validate_model_performance(validation_loader, training_model, current_epoch, tensorboard_writer, args):
@@ -747,6 +1107,60 @@ def validate_model_performance(validation_loader, training_model, current_epoch,
             tensorboard_writer.add_scalar("val/loss", avg_val_loss, current_epoch)
 
         return avg_val_loss
+
+def load_eval_env_infos(args, config):
+    global eval_env_meta_list, eval_env_name_list, eval_env_horizon_list
+    # extract the metadata across all datasets
+    # eval_env_meta_list = []
+    # eval_env_name_list = []
+    # eval_env_horizon_list = []
+    for dataset_cfg in config.train.data:
+        dataset_path = os.path.expanduser(dataset_cfg["path"])
+        ds_format = config.train.data_format
+        if not os.path.exists(dataset_path):
+            raise Exception("Dataset at provided path {} not found!".format(dataset_path))
+
+        # load basic metadata from training file
+        print("\n============= Loaded Environment Metadata =============")
+        env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=dataset_path, ds_format=ds_format)
+        # populate language instruction for env in env_meta
+        env_meta["env_lang"] = dataset_cfg.get("lang", None)
+
+        # update env meta if applicable
+        deep_update(env_meta, dataset_cfg.get("env_meta_update_dict", {}))
+        deep_update(env_meta, config.experiment.env_meta_update_dict)
+        # env_meta_list.append(env_meta)
+        
+        if env_meta["env_name"] not in VAL_ENV_INFOS or dataset_cfg.get("do_eval", True) == False:
+            continue
+        eval_env_meta_list.append(env_meta)
+        eval_env_name_list.append(env_meta["env_name"])
+        horizon = dataset_cfg.get("horizon", config.experiment.rollout.horizon)
+        eval_env_horizon_list.append(horizon)
+
+
+def env_iterator(config):
+    for (env_meta, env_name) in zip(eval_env_meta_list, eval_env_name_list):
+        if env_name != "PnPCounterToCab":  # for one task
+            continue
+        def create_env_helper(env_i=0):
+            env_kwargs = dict(
+                env_meta=env_meta,
+                env_name=env_name,
+                render=False,
+                render_offscreen=config.experiment.render_video,
+                use_image_obs=True,
+                seed=config.train.seed * 1000 + env_i,
+            )
+            env = EnvUtils.create_env_from_metadata(**env_kwargs)
+            # handle environment wrappers
+            env = EnvUtils.wrap_env_from_config(env, config=config)  # apply environment warpper, if applicable
+
+            return env
+
+        env = create_env_helper()
+        # print(env)
+        yield env
 
 
 if __name__ == "__main__":

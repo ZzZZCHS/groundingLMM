@@ -5,6 +5,7 @@ of numpy arrays and torch tensors.
 import collections
 import numpy as np
 import torch
+import ml_dtypes
 
 
 def recursive_dict_list_tuple_apply(x, type_func_dict):
@@ -312,9 +313,13 @@ def to_numpy(x):
     """
     def f(tensor):
         if tensor.is_cuda:
-            return tensor.detach().cpu().numpy()
+            tensor = tensor.detach().cpu()
         else:
-            return tensor.detach().numpy()
+            tensor = tensor.detach()
+        if tensor.dtype == torch.bfloat16:
+            return tensor.float().numpy()
+        else:
+            return tensor.numpy()
     return recursive_dict_list_tuple_apply(
         x,
         {
@@ -366,7 +371,7 @@ def to_float(x):
     return recursive_dict_list_tuple_apply(
         x,
         {
-            torch.Tensor: lambda x: x.float(),
+            torch.Tensor: lambda x: x.bfloat16(),
             np.ndarray: lambda x: x.astype(np.float32),
             type(None): lambda x: x,
         }

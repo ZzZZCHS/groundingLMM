@@ -15,3 +15,4 @@ gpt
 tmp/
 infer_results/
 save_images/
+MUJOCO_LOG.TXT

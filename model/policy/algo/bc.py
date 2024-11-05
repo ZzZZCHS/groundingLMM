@@ -346,7 +346,7 @@ class BC_Transformer(BC):
             predictions["actions"] = predictions["actions"][:, -1, :]
         return predictions
 
-    def get_action(self, obs_dict, goal_dict=None):
+    def get_action(self, obs_dict, goal_dict=None, mask_embeds=None):
         """
         Get policy action outputs.
         Args:
@@ -357,7 +357,7 @@ class BC_Transformer(BC):
         """
         assert not self.nets.training
 
-        output = self.nets["policy"](obs_dict, actions=None, goal_dict=goal_dict)
+        output = self.nets["policy"](obs_dict, actions=None, goal_dict=goal_dict, mask_embeds=mask_embeds)
 
         if self.supervise_all_steps:
             if self.algo_config.transformer.pred_future_acs:

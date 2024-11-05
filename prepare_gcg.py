@@ -39,7 +39,7 @@ from tools.prompt_templates import GVLA_PROMPT_TEMPLATE
 # breakpoint()
 train_annos = []
 cam_names = ["robot0_agentview_left", "robot0_agentview_right", "robot0_eye_in_hand"]
-generated_data_dir = 'data/robocasa_datasets/v0.1/generated_1013'
+generated_data_dir = 'data/robocasa_datasets/v0.1/generated_1024'
 img_dir = os.path.join(generated_data_dir, "images")
 if not os.path.exists(img_dir):
     os.mkdir(img_dir)
@@ -81,6 +81,7 @@ for hdf5_file_name in tqdm(os.listdir(generated_data_dir)):
                 file_name = f"{image_id}.jpg"
                 save_path = os.path.join(img_dir, file_name)
                 cur_image, cur_mask = obs_data_grp[image_key][0], obs_data_grp[mask_key][0]
+                cur_mask = cur_mask[:, :, 0]
                 tmp_image = Image.fromarray(cur_image)
                 tmp_image.save(save_path)
                 groundings = {}
